@@ -1,0 +1,9 @@
+include README.md LICENSE AGENTS.md SECURITY.md requirements-tested.txt
+recursive-include plugin *.py *.yaml
+recursive-include scripts *.py
+recursive-include docs *.md
+recursive-include examples *.yaml *.json .env.example
+recursive-include tests *.py
+recursive-include .github *.yml
+exclude docs/junit-local.xml
+global-exclude __pycache__ *.py[cod]

@@ -1,0 +1,22 @@
+{
+  "network": {
+    "httpServers": [],
+    "httpSseServers": [],
+    "httpClients": [],
+    "websocketServers": [
+      {
+        "name": "hermes",
+        "enable": true,
+        "host": "127.0.0.1",
+        "port": 3001,
+        "messagePostFormat": "array",
+        "reportSelfMessage": false,
+        "token": "replace-with-a-generated-random-token",
+        "enableForcePushEvent": true,
+        "debug": false,
+        "heartInterval": 30000
+      }
+    ],
+    "websocketClients": []
+  }
+}

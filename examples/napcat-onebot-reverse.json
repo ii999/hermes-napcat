@@ -1,0 +1,21 @@
+{
+  "network": {
+    "httpServers": [],
+    "httpSseServers": [],
+    "httpClients": [],
+    "websocketServers": [],
+    "websocketClients": [
+      {
+        "name": "hermes-reverse",
+        "enable": true,
+        "url": "ws://127.0.0.1:3002/onebot/v11",
+        "messagePostFormat": "array",
+        "reportSelfMessage": false,
+        "token": "replace-with-a-generated-random-token",
+        "reconnectInterval": 3000,
+        "heartInterval": 30000,
+        "debug": false
+      }
+    ]
+  }
+}

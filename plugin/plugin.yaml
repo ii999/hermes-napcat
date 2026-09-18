@@ -1,0 +1,23 @@
+name: napcat
+label: NapCat / QQ
+kind: platform
+version: 0.1.0
+description: OneBot v11 full-duplex WebSocket adapter for NapCatQQ
+author: ii999
+requires_env:
+  - name: NAPCAT_TOKEN
+    description: OneBot WebSocket access token (not the NapCat WebUI token)
+    password: true
+optional_env:
+  - name: NAPCAT_SELF_ID
+    description: Expected logged-in QQ account
+    password: false
+  - name: NAPCAT_ALLOWED_USERS
+    description: Comma-separated QQ user IDs; empty denies users
+    password: false
+  - name: NAPCAT_ALLOW_ALL_USERS
+    description: Explicit allow-all switch; false is recommended
+    password: false
+  - name: NAPCAT_HOME_CHANNEL
+    description: Default delivery target, private:QQ or group:ID
+    password: false

@@ -1,0 +1,28 @@
+# Merge this into the existing Hermes config.yaml; keep your model/provider configuration.
+# Current Hermes default is per-user group sessions. Set false only for a trusted shared group.
+group_sessions_per_user: true
+plugins:
+  entries:
+    napcat:
+      enabled: true
+gateway:
+  platforms:
+    napcat:
+      enabled: true
+      extra:
+        self_id: '123456789'
+        mode: forward
+        ws_url: ws://127.0.0.1:3001
+        allowed_groups: ['987654321']
+        admins: ['111111111']
+        group_mention: true
+        group_reply_to_bot: true
+        group_prefixes: ['/ai']
+        group_toolsets: []
+        media:
+          outbound_roots: []
+          shared_paths: []
+# Safe starting point: the agent can reply, but cannot invoke tools.
+# Enable only the toolsets you intend to grant after validating this installation.
+platform_toolsets:
+  napcat: []
