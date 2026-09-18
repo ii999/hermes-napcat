@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from hermes_napcat.config import MediaSettings, SharedPath, numeric_id
+from hermes_napcat.config import MediaSettings, QQToolsSettings, SharedPath, numeric_id
 from hermes_napcat.plugin import parse_target_ref, settings_from_extra, validate_target_ref
 from hermes_napcat.policy import Policy, RecentIDs
 from hermes_napcat.protocol import Incoming, ProtocolError, Target, message_id, segments, split_text, text_segments
@@ -68,6 +68,14 @@ def test_media_roots_are_explicit_and_dedicated(tmp_path):
         MediaSettings(allowed_hosts=["*.qq.com"])
     with pytest.raises(ValidationError):
         MediaSettings(trusted_private_origins=["http://localhost:9/api"])
+
+
+def test_agent_qq_tools_are_default_off_and_bounded():
+    assert QQToolsSettings().enabled is False
+    with pytest.raises(ValidationError):
+        QQToolsSettings(max_forward_nodes=101)
+    with pytest.raises(ValidationError):
+        QQToolsSettings(max_local_media_bytes=512)
 
 
 def test_segment_normalization_and_cq_injection(raw_event):

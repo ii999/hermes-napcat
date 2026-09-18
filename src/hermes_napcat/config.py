@@ -102,6 +102,22 @@ class MediaSettings(StrictModel):
         return self
 
 
+class QQToolsSettings(StrictModel):
+    """Limits and opt-ins for model-callable QQ actions."""
+
+    enabled: bool = False
+    allow_cross_chat: bool = False
+    max_segments: int = Field(default=64, ge=1, le=256)
+    max_media_items: int = Field(default=8, ge=1, le=32)
+    max_forward_nodes: int = Field(default=50, ge=1, le=100)
+    max_forward_chars: int = Field(default=50_000, ge=100, le=200_000)
+    max_local_media_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        ge=1024,
+        le=4 * 1024 * 1024 * 1024,
+    )
+
+
 class Settings(StrictModel):
     self_id: str
     token: SecretStr
@@ -134,6 +150,7 @@ class Settings(StrictModel):
     # Replacement toolset for group sessions. Empty means no model tools.
     group_toolsets: tuple[str, ...] = ()
     media: MediaSettings = Field(default_factory=MediaSettings)
+    qq_tools: QQToolsSettings = Field(default_factory=QQToolsSettings)
 
     @field_validator("self_id", mode="before")
     @classmethod

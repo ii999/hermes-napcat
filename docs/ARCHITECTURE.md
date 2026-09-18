@@ -2,9 +2,9 @@
 
 ## 模块职责
 
-`config.py` 校验配置并隐藏错误输入中的密钥；`protocol.py` 负责 OneBot 消息段、目标和标识符；`policy.py` 负责白名单、触发、限流和有界去重；`transport.py` 负责正反向 WebSocket、账号校验和 action/echo；`media.py` 负责下载与受控路径映射；`adapter.py` 构造 Hermes 事件并发送回复；`plugin.py` 注册平台和主机驱动投递钩子；`cli.py` 提供人工诊断。
+`config.py` 校验配置并隐藏错误输入中的密钥；`protocol.py` 负责 OneBot 消息段、目标和标识符；`policy.py` 负责白名单、触发、限流和有界去重；`transport.py` 负责正反向 WebSocket、账号校验和 action/echo；`media.py` 负责下载与受控路径映射；`adapter.py` 构造 Hermes 事件并执行受控 QQ 动作；`tools.py` 绑定当前 session、校验工具参数并注册 `napcat_qq`；`plugin.py` 注册平台和主机驱动投递钩子；`cli.py` 提供人工诊断。
 
-目录插件 `plugin/__init__.py` 暴露 `register(ctx)`，实现代码装入 Hermes 的 Python 环境。入口保持轻量，导入时不连接 QQ、不安装依赖、不读取其他 profile 的令牌。
+目录插件 `plugin/__init__.py` 暴露 `register(ctx)`，`plugin/tools.py` 为 Hermes 的延迟平台加载器提供独立 `register_tools(ctx)`。实现代码装入 Hermes 的 Python 环境。工具发现不会导入 adapter 或连接 QQ；平台加载时重复注册采用 Hermes 的同一插件作用域。
 
 ## 入站与鉴权
 
@@ -28,7 +28,13 @@ worker 按聊天键顺序进入 adapter，跨聊天最多并行 event_workers �
 
 插件注册 Hermes 的 `parse_target_ref_fn`、`validate_target_ref_fn`、`cron_deliver_env_var` 和 `standalone_sender_fn`，由主机驱动发送。独立 sender 建立只发不处理事件的正向连接，结束后关闭资源。反向模式需要已经运行的 Gateway，独立 sender 返回明确错误。
 
-v0.1 没有注册模型可调用的任意发送、群管理或 QQ 空间工具。后续增加 context/admin 工具时，应绑定当前 source、默认拒绝跨群访问、限制返回量，并为不可逆管理操作设置独立授权，不能包装一个任意 action 透传工具。
+`napcat_qq` 只暴露五个有界工具，不提供任意 OneBot action 透传。handler 从 Hermes `gateway.session_context` 读取当前 platform、chat、user、profile 和 message ID，再从正在运行的 Gateway 解析该 profile 自己的 adapter。非 NapCat turn、无实时 Gateway 或 profile 没有 adapter 时均失败关闭。
+
+工具目标默认固定为当前会话。跨会话需要配置显式开启、当前用户属于 `admins`、目标通过 adapter 白名单三项条件。群消息引用通过 `group_id` 核验；私聊引用只接受目标联系人发来的消息、当前入站消息，或本进程按目标记住的机器人消息。读取工具只返回有界文本、发送者和附件类型，不返回媒体 URL 或原始事件。
+
+模型提供的媒体 URL 先走 `MediaStore`，不会直接交给 NapCat 下载。本地路径仍受 `outbound_roots`、真实路径解析、工具字节上限和共享路径映射约束。合并转发先核验全部已有消息节点，再下载自建节点媒体，最后执行一次发送，避免验证中途产生不可逆动作。自建节点使用机器人 QQ 号，模型只能设置显示标签。
+
+相同 session、当前消息和参数的并发工具调用在 adapter 的 Gateway loop 上共用一个 in-flight Task。Task 完成后立即移除，不形成长期幂等缓存。调用方取消后，已经调度的发送继续得到结果，避免上层把取消误判为“未执行”并自动重发。媒体正文分开发送时，后半段失败会返回部分成功状态。
 
 ## 网络、媒体和存储
 
