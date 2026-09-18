@@ -19,6 +19,9 @@ gateway:
         group_reply_to_bot: true
         group_prefixes: ['/ai']
         group_toolsets: []
+        qq_tools:
+          enabled: false
+          allow_cross_chat: false
         media:
           outbound_roots: []
           shared_paths: []

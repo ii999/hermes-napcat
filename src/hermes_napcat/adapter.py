@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
@@ -31,6 +33,7 @@ class NapCatAdapter(BasePlatformAdapter):
         self.transport = OneBotTransport(self.settings, self._receive if receive_events else self._ignore)
         self.media: MediaStore | None = None
         self._send_gate = asyncio.Lock()
+        self._agent_actions: dict[str, asyncio.Task[Any]] = {}
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if self.transport.running:
@@ -185,10 +188,16 @@ class NapCatAdapter(BasePlatformAdapter):
                           raw_response={"partial_message_ids": ids or [], "delivery_uncertain": uncertain})
 
     async def _send_parts(self, target: Target, parts: list[dict[str, Any]]) -> str:
+        return await self._send_action_with_id(
+            target, target.action, {**target.params, "message": parts})
+
+    async def _send_action_with_id(
+        self, target: Target, action: str, params: dict[str, Any],
+    ) -> str:
         if not self.policy.can_send(target):
             raise PermissionError("target is not allowlisted")
         async with self._send_gate:
-            result = await self.transport.call(target.action, {**target.params, "message": parts})
+            result = await self.transport.call(action, params)
             if not isinstance(result, dict) or result.get("message_id") is None:
                 raise DeliveryUncertain("OneBot acknowledged a send without a message ID")
             try:
@@ -199,6 +208,195 @@ class NapCatAdapter(BasePlatformAdapter):
             if self.settings.send_interval:
                 await asyncio.sleep(self.settings.send_interval)
             return identifier
+
+    async def run_agent_action(
+        self, key: str, operation: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        """Coalesce the same in-flight model action without caching completed sends."""
+        task = self._agent_actions.get(key)
+        if task is None:
+            task = asyncio.create_task(operation(), name="napcat-agent-action")
+            self._agent_actions[key] = task
+
+            def forget(done: asyncio.Task[Any]) -> None:
+                if self._agent_actions.get(key) is done:
+                    self._agent_actions.pop(key, None)
+                try:
+                    done.exception()
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            task.add_done_callback(forget)
+        # A cancelled tool worker must not cancel a send already accepted by the gateway loop.
+        return await asyncio.shield(task)
+
+    async def outbound_reference(self, source: str, *, kind: str) -> str:
+        if self.media is None:
+            raise MediaError("media store is not ready")
+        if not isinstance(source, str) or not source.strip():
+            raise MediaError("media source is required")
+        source = source.strip()
+        try:
+            scheme = urlsplit(source).scheme.lower()
+        except ValueError as exc:
+            raise MediaError("invalid media source") from exc
+        if scheme in ("http", "https"):
+            downloaded = await self.media.download(source, kind=kind)
+            return await asyncio.to_thread(self.media.cached_reference, downloaded)
+        windows_drive = len(source) >= 3 and source[0].isalpha() and source[1:3] in (":/", ":\\")
+        if scheme and not windows_drive:
+            raise MediaError("media source must be an allowed local path or http(s) URL")
+
+        def local_reference() -> str:
+            path = self.media.local_path(source)
+            if path.stat().st_size > self.settings.qq_tools.max_local_media_bytes:
+                raise MediaError("local media exceeds qq_tools.max_local_media_bytes")
+            return self.media.outbound_reference(source)
+
+        return await asyncio.to_thread(local_reference)
+
+    async def send_agent_media(
+        self,
+        target: Target,
+        kind: str,
+        source: str,
+        *,
+        caption: str | None = None,
+        file_name: str | None = None,
+        thumbnail: str | None = None,
+        reply_to: str | None = None,
+    ) -> dict[str, Any]:
+        """Send one validated media item and preserve partial-delivery state."""
+        if kind not in ("image", "audio", "video", "file"):
+            raise ValueError("unsupported media type")
+        if not self.policy.can_send(target):
+            raise PermissionError("target is not allowlisted")
+        if caption is not None:
+            if not isinstance(caption, str) or not caption.strip():
+                caption = None
+            elif len(caption) > self.settings.message_chars:
+                raise ValueError("caption is too long")
+        if reply_to is not None:
+            reply_to = message_id(reply_to)
+        name = file_name
+        if kind == "file":
+            name = name or Path(urlsplit(source).path or source).name
+            if (not isinstance(name, str) or not name or "/" in name or "\\" in name
+                    or len(name) > 200 or name in (".", "..")):
+                raise ValueError("invalid attachment name")
+            if reply_to is not None and caption is None:
+                raise ValueError("a file reply requires caption text")
+
+        reference = await self.outbound_reference(source, kind="record" if kind == "audio" else kind)
+        thumb_reference = None
+        if thumbnail is not None:
+            if kind != "video":
+                raise ValueError("thumbnail is only valid for video")
+            thumb_reference = await self.outbound_reference(thumbnail, kind="image")
+
+        ids: list[str] = []
+        if kind == "file":
+            async with self._send_gate:
+                upload = await self.transport.call(
+                    f"upload_{target.kind}_file",
+                    {**target.params, "file": reference, "name": name, "upload_file": True},
+                )
+            if caption:
+                try:
+                    ids.append(await self._send_parts(target, text_segments(caption, reply_to)))
+                except (OneBotError, ValueError, PermissionError) as exc:
+                    return {
+                        "success": False,
+                        "partial": True,
+                        "file_uploaded": True,
+                        "file_id": upload.get("file_id") if isinstance(upload, dict) else None,
+                        "message_ids": ids,
+                        "delivery_uncertain": isinstance(exc, DeliveryUncertain),
+                        "error": "file uploaded but caption delivery failed",
+                    }
+            return {
+                "success": True,
+                "file_uploaded": True,
+                "file_id": upload.get("file_id") if isinstance(upload, dict) else None,
+                "message_ids": ids,
+            }
+
+        segment_kind = "record" if kind == "audio" else kind
+        data = {"file": reference}
+        if thumb_reference is not None:
+            data["thumb"] = thumb_reference
+        prefix = ([{"type": "reply", "data": {"id": reply_to}}] if reply_to else [])
+        if kind == "image" and caption:
+            prefix.append({"type": "text", "data": {"text": caption}})
+        ids.append(await self._send_parts(
+            target, [*prefix, {"type": segment_kind, "data": data}]))
+        # QQ clients handle voice/video captions more consistently as a separate message.
+        if kind in ("audio", "video") and caption:
+            try:
+                ids.append(await self._send_parts(target, text_segments(caption)))
+            except (OneBotError, ValueError, PermissionError) as exc:
+                return {
+                    "success": False,
+                    "partial": True,
+                    "media_delivered": True,
+                    "message_ids": ids,
+                    "delivery_uncertain": isinstance(exc, DeliveryUncertain),
+                    "error": "media delivered but caption delivery failed",
+                }
+        return {"success": True, "message_ids": ids}
+
+    async def send_agent_parts(
+        self, target: Target, parts: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        identifier = await self._send_parts(target, parts)
+        return {"success": True, "message_id": identifier}
+
+    async def send_agent_forward(
+        self,
+        target: Target,
+        nodes: list[dict[str, Any]],
+        *,
+        source: str | None = None,
+        summary: str | None = None,
+        prompt: str | None = None,
+        preview: list[str] | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {**target.params, "messages": nodes}
+        for key, value in (("source", source), ("summary", summary), ("prompt", prompt)):
+            if value:
+                params[key] = value
+        if preview:
+            params["news"] = [{"text": line} for line in preview]
+        identifier = await self._send_action_with_id(
+            target, f"send_{target.kind}_forward_msg", params)
+        return {"success": True, "message_id": identifier}
+
+    async def verified_message(
+        self, target: Target, identifier: str, *, current_message_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Fetch a message and prove that it belongs to the authorized target."""
+        if not self.policy.can_send(target):
+            raise PermissionError("target is not allowlisted")
+        identifier = message_id(identifier)
+        data = await self.transport.call("get_msg", {"message_id": int(identifier)})
+        if not isinstance(data, dict) or data.get("message_type") != target.kind:
+            raise PermissionError("message does not belong to the target conversation")
+        if target.kind == "group":
+            belongs = str(data.get("group_id")) == target.id
+        else:
+            sender = data.get("sender") if isinstance(data.get("sender"), dict) else {}
+            author = str(data.get("user_id") or sender.get("user_id") or "")
+            destination = str(data.get("target_id") or "")
+            belongs = (
+                identifier == current_message_id
+                or author == target.id
+                or destination == target.id
+                or (author == self.settings.self_id
+                    and self.policy.own.contains((target.address, identifier)))
+            )
+        if not belongs:
+            raise PermissionError("message does not belong to the target conversation")
+        return data
 
     async def send(self, chat_id: str, content: str, reply_to=None, metadata=None) -> SendResult:
         ids: list[str] = []

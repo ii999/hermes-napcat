@@ -10,7 +10,7 @@ import pytest
 from aiohttp import web
 
 from hermes_napcat.config import MediaSettings
-from hermes_napcat.media import MediaError, MediaStore, SafeResolver
+from hermes_napcat.media import Downloaded, MediaError, MediaStore, SafeResolver
 
 # An actual 1x1 PNG; this test does not use an external image service.
 PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9f8AAAAASUVORK5CYII=")
@@ -110,6 +110,24 @@ def test_cache_prune_only_deletes_owned_expired_files(tmp_path):
         os.utime(path, (old, old))
     assert store._prune_and_usage() == 0
     assert user_file.read_bytes() == b"keep" and not old_file.exists()
+
+
+def test_cached_reference_accepts_only_unchanged_owned_inline_file(tmp_path):
+    store = MediaStore(MediaSettings(inline_max_bytes=1024), tmp_path / "cache")
+    owned = store.root / ("napcat_" + "c" * 32 + ".png")
+    owned.write_bytes(PNG)
+    downloaded = Downloaded(owned, "image/png", len(PNG))
+    encoded = store.cached_reference(downloaded)
+    assert base64.b64decode(encoded.removeprefix("base64://")) == PNG
+
+    owned.write_bytes(PNG + b"changed")
+    with pytest.raises(MediaError, match="changed"):
+        store.cached_reference(downloaded)
+
+    foreign = tmp_path / ("napcat_" + "d" * 32 + ".png")
+    foreign.write_bytes(PNG)
+    with pytest.raises(MediaError, match="not owned"):
+        store.cached_reference(Downloaded(foreign, "image/png", len(PNG)))
 
 
 async def test_cache_quota_refuses_new_download_without_deleting_recent(tmp_path):

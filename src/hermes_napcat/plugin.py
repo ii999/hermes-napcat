@@ -78,7 +78,7 @@ async def standalone_send(pconfig, chat_id, message, *, thread_id=None,
             return {"error": "Could not establish the OneBot sender"}
         # Do not partially deliver a compound standalone request whose file contract we don't implement.
         if media_files:
-            return {"error": "Standalone media requests are not supported in v0.1; use the live adapter"}
+            return {"error": "Standalone media requests are not supported; use the live adapter"}
         result = await adapter.send(chat_id, message)
         if result.success:
             return {"success": True, "message_id": result.message_id}
@@ -89,6 +89,9 @@ async def standalone_send(pconfig, chat_id, message, *, thread_id=None,
 
 def register(ctx):
     from .adapter import NapCatAdapter
+    from .tools import register_tools
+
+    register_tools(ctx)
     ctx.register_platform(
         name="napcat", label="NapCat / QQ", adapter_factory=NapCatAdapter,
         check_fn=check_requirements, validate_config=validate_config,
