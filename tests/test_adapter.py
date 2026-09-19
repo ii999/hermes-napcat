@@ -125,11 +125,20 @@ async def test_outbound_media_and_irreversible_upload_validation(hermes_doubles,
     assert adapter.transport.call.call_args.args[1]["message"][-1]["data"]["file"] == "file:///data/share/report.txt"
 
 
-def test_plugin_registration_exposes_gateway_hooks_only(hermes_doubles):
+def test_plugin_registration_exposes_gateway_hooks_and_qq_tools(hermes_doubles):
     captured = {}
-    register(SimpleNamespace(register_platform=lambda **kwargs: captured.update(kwargs)))
+    registered_tools = []
+    register(SimpleNamespace(
+        register_platform=lambda **kwargs: captured.update(kwargs),
+        register_tool=lambda **kwargs: registered_tools.append(kwargs),
+    ))
     assert captured["name"] == "napcat"
     assert captured["allowed_users_env"] == "NAPCAT_ALLOWED_USERS"
     assert captured["allow_update_command"] is False
     assert callable(captured["standalone_sender_fn"])
     assert captured["parse_target_ref_fn"]("private:200") == ("private:200", None)
+    assert {item["name"] for item in registered_tools} == {
+        "qq_send_message", "qq_send_media", "qq_send_forward", "qq_get_message",
+        "qq_get_chat_info",
+    }
+    assert all(item["toolset"] == "napcat_qq" for item in registered_tools)

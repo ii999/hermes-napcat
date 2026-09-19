@@ -244,6 +244,20 @@ class MediaStore:
             raise MediaError("file exceeds inline limit; configure shared_paths for larger files")
         return "base64://" + base64.b64encode(value).decode("ascii")
 
+    def cached_reference(self, downloaded: Downloaded) -> str:
+        """Encode one file produced by this store, without widening outbound roots."""
+        candidate = downloaded.path.resolve(strict=True)
+        if (candidate.parent != self.root or not _OWN_FILE.fullmatch(candidate.name)
+                or not candidate.is_file()):
+            raise MediaError("downloaded media is not owned by this cache")
+        if downloaded.size > self.config.inline_max_bytes:
+            raise MediaError("downloaded media exceeds inline upload limit")
+        with candidate.open("rb") as stream:
+            value = stream.read(self.config.inline_max_bytes + 1)
+        if len(value) != downloaded.size or len(value) > self.config.inline_max_bytes:
+            raise MediaError("downloaded media changed or exceeds inline upload limit")
+        return "base64://" + base64.b64encode(value).decode("ascii")
+
     async def close(self) -> None:
         if self._session is not None:
             await self._session.close()

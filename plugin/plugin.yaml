@@ -1,9 +1,15 @@
 name: napcat
 label: NapCat / QQ
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: OneBot v11 full-duplex WebSocket adapter for NapCatQQ
 author: ii999
+provides_tools:
+  - qq_send_message
+  - qq_send_media
+  - qq_send_forward
+  - qq_get_message
+  - qq_get_chat_info
 requires_env:
   - name: NAPCAT_TOKEN
     description: OneBot WebSocket access token (not the NapCat WebUI token)

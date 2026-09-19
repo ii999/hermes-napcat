@@ -36,7 +36,7 @@ def main() -> None:
     if target.exists() or target.is_symlink():
         if not args.upgrade or target.is_symlink():
             parser.error("plugin directory already exists; inspect it before using --upgrade")
-        allowed = {"__init__.py", "plugin.yaml", "__pycache__"}
+        allowed = {"__init__.py", "plugin.yaml", "tools.py", "__pycache__"}
         if any(p.name not in allowed for p in target.iterdir()):
             parser.error("existing directory has other files; refusing to replace it")
         manifest = target / "plugin.yaml"

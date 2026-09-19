@@ -1,7 +1,7 @@
-# Versions present in the local Python 3.13.5 verification environment.
-aiohttp==3.13.3
-pydantic==2.13.4
+# Direct versions present in the local Python 3.12.14 verification environment.
+aiohttp==3.14.3
+pydantic==2.13.5
 PyYAML==6.0.3
-pytest==9.0.2
-pytest-asyncio==1.3.0
-setuptools==82.0.1
+pytest==9.1.1
+pytest-asyncio==1.4.0
+ruff==0.16.8
