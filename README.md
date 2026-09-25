@@ -2,7 +2,7 @@
 
 通过 OneBot v11 双向 WebSocket，把 NapCat QQ 接入 Hermes Gateway。项目使用 Python 3.12+、`uv` 和 `/src` 布局，以独立 Python 包与目录插件入口分发，不修改 Hermes 源码。
 
-当前版本：**0.2.0，待真实 QQ 联调**。我们核验了 Hermes `v2026.9.14`（0.21.3）的源码接口，并运行本地协议、网络与安全边界测试。完整 Hermes Gateway、模型调用、QQ 登录和媒体编码仍需要在部署环境验收。详见 [测试记录](docs/TESTING.md)。
+当前包版本：**0.2.0，待真实 QQ 联调**。本分支新增可选群聊上下文与参与策略，默认关闭。我们核验了 Hermes `v2026.9.14`（0.21.3）的源码接口；完整 Hermes Gateway、模型调用、QQ 登录和媒体编码仍需要在部署环境验收。详见 [测试记录](docs/TESTING.md) 与 [群聊功能和验收说明](docs/GROUP_CHAT.md)。
 
 ```text
 QQ ↔ NapCat ↔ OneBot v11 WebSocket ↔ napcat 插件 ↔ Hermes Gateway ↔ Agent
@@ -10,24 +10,27 @@ QQ ↔ NapCat ↔ OneBot v11 WebSocket ↔ napcat 插件 ↔ Hermes Gateway ↔ 
 
 默认由插件连接 NapCat WebSocket Server。反向模式由 NapCat 连接插件的 `/onebot/v11`。消息事件、API 请求及 `echo` 响应共用一条连接，插件不依赖 NapCat HTTP API。
 
-## 首版范围
+## 能力与边界
 
 | 能力 | 实现与边界 |
 | --- | --- |
 | 私聊、群聊 | 用户白名单；群聊还必须满足群白名单；自己发送的消息不触发 Agent |
 | 群触发 | `@机器人`、经过服务端校验的回复、带词边界的 `/ai` 前缀 |
+| 群聊上下文 | 可选实时观察、按需有界历史回填、发言人/时间/@/引用归属；`channel_context` 注入，保留按用户划分的会话 |
+| 主动参与 | 可选静默窗口、连发片段合并、规则或无工具分类器；默认关闭，启用后默认 dry-run，具有冷却/预算和发送前过期检查 |
+| 群撤回 | 启用上下文后处理 `group_recall`，移除缓存并阻止窗口内的历史回填复活；不能收回已发送给模型的数据 |
 | Hermes 接入 | 原生 `BasePlatformAdapter`，`SessionSource`、账号上下文、媒体事件；会话由 Gateway 管理 |
 | 文本回复 | 结构化消息段、引用、分段发送；不会把模型输出的 CQ 字符串解释为控制指令 |
 | WebSocket | 正向/反向、Bearer token、登录账号核验、心跳、重连、超时、并发 echo 关联 |
-| 消息可靠性 | 有界队列、同聊天顺序、跨聊天并行、限流、内存去重；发送结果不确定时不会重发 |
-| 入站媒体 | 图片、语音、视频、文件的 URL 下载与事件映射；缺 URL 或格式不支持时给出未读取说明 |
+| 消息可靠性 | 有界队列、同聊天请求顺序、跨聊天并行、限流、内存去重；发送结果不确定时不会重发 |
+| 入站媒体 | 图片、语音、视频、文件的 URL 下载与事件映射；缺 URL 或格式不支持时给出未读取说明；被动观察不下载附件 |
 | 出站媒体 | 本地图片/音频/视频通过小文件 base64 或共享路径发送；基础文档接口要求共享路径，Agent 文件工具也支持受限的小文件 base64 |
-| Agent QQ 工具 | 可选 `napcat_qq` 工具集：图文/媒体发送、引用、合并转发、单条消息与会话信息读取 |
-| 权限 | 网关控制指令限 `admins`；群聊默认无模型工具；发送目标也检查白名单 |
+| Agent QQ 工具 | 可选 `napcat_qq` 工具集：图文/媒体发送、引用、合并转发、单条消息与会话信息读取，新增有界 `qq_get_recent_messages` |
+| 权限 | 网关控制指令限 `admins`；群聊默认无模型工具；观察权限不授予执行权限；实际主动回复要求无工具群会话；发送目标也检查白名单 |
 | 主动推送 | 注册原生目标解析与 cron standalone sender；独立进程仅支持正向连接的文本推送 |
 | 运维 | 配置检查、连接探测、人工测试发送、安装脚本、私有 GitHub 仓库发布脚本 |
 
-本版不包含 QQ 群管理/空间工具集、被动群历史收集、Relay、持久消息队列、跨机器大文件流式上传或语音转码。音频能否进入 Hermes STT、音视频能否在 QQ 播放，还取决于实际格式与运行环境。Agent 工具默认关闭，配置方法见 [Agent QQ 工具](docs/QQ_TOOLS.md)。开发计划见 [ROADMAP](docs/ROADMAP.md)。
+本版不包含 QQ 群管理/空间工具集、持久群历史存档、Relay、持久消息队列、跨机器大文件流式上传或语音转码。音频能否进入 Hermes STT、音视频能否在 QQ 播放，还取决于实际格式与运行环境。Agent 工具默认关闭，配置方法见 [Agent QQ 工具](docs/QQ_TOOLS.md)。开发计划见 [ROADMAP](docs/ROADMAP.md)。
 
 ## 1. 准备环境
 
@@ -42,7 +45,7 @@ uv run pytest -q
 
 仓库附带 `uv.lock` 以固定 Python 依赖解析结果。项目不自动下载 Hermes、QQ 客户端或 NapCat。
 
-发行包另附 `requirements-tested.txt`，记录本次本地验收的依赖版本。该文件用于复现实验环境，不代替完整跨平台锁文件。
+发行包另附 `requirements-tested.txt`，记录此前本地验收的依赖版本。该文件用于复现实验环境，不代替完整跨平台锁文件；本分支的 CI 结果以 GitHub Actions 为准。
 
 ## 2. 配置 NapCat
 
@@ -89,7 +92,7 @@ uv run --no-project python scripts/install_plugin.py \
   --hermes-home /srv/hermes-home
 ```
 
-从 0.1.x 升级时增加 `--upgrade`。安装脚本会同时更新 `plugin.yaml`、目录入口和延迟加载的 `tools.py`；只替换 wheel 会留下旧入口，Hermes 无法发现新工具。
+从旧版升级时增加 `--upgrade`。安装脚本会同时更新 `plugin.yaml`、目录入口和延迟加载的 `tools.py`；只替换 wheel 会留下旧入口，Hermes 无法发现新工具。
 
 安装脚本通过 `uv pip` 安装包，随后用该解释器运行真实 Hermes 接口检查，再将 `plugin/` 安装到 `<hermes-home>/plugins/napcat/`。它不会改写 Hermes 核心代码或现有配置文件。安装失败会返回非零退出码。已有同名目录时需要检查后使用 `--upgrade`；脚本会把旧入口备份到 `<hermes-home>/plugin-backups/`。
 
@@ -140,6 +143,12 @@ platform_toolsets:
 
 启动方式沿用你的 Hermes 部署，可以在专用工作目录下运行 `hermes gateway run`，也可以重启已经配置的 gateway 服务。
 
+### 可选：群聊背景与主动参与
+
+合并 `examples/group-chat.config.yaml`。`group_context.enabled: true` 开启在线观察和被点名时的历史背景；`observe_all_members: true` 需要管理员明确授权及群成员知晓数据用途，不授予其他群友 Agent 权限。`proactive_assist` 默认关闭，示例开启的是只判断不发言的 dry-run。实际主动回复需要 `dry_run: false` 且 `group_toolsets: []`。
+
+完整配置、可选轻量分类器、近期消息读取工具、隐私边界和实机验收方法见 [GROUP_CHAT](docs/GROUP_CHAT.md)。普通观察不下载附件；历史窗口不等于完整群档案，也不能保证补齐断线期间的全部消息。
+
 ### 可选：Agent 主动操作 QQ
 
 完成基础收发验收后，可以按需开放 `napcat_qq`：
@@ -161,7 +170,7 @@ gateway:
           outbound_roots: [/srv/qq-output]
 ```
 
-工具默认绑定当前 QQ 会话。跨会话调用还需要 `allow_cross_chat: true`、当前用户属于 `admins` 且目标通过白名单。媒体来源限允许目录或经过下载安全检查的 HTTP(S) URL；合并转发中的已有消息也要核验来源。完整参数、折叠对话和部分成功语义见 [QQ_TOOLS](docs/QQ_TOOLS.md)，可合并的配置见 `examples/qq-tools.config.yaml`。
+工具默认绑定当前 QQ 会话。跨会话调用还需要 `allow_cross_chat: true`、当前用户属于 `admins` 且目标通过白名单。媒体来源限允许目录或经过下载安全检查的 HTTP(S) URL；合并转发中的已有消息也要核验来源。完整参数、折叠对话和部分成功语义见 [QQ_TOOLS](docs/QQ_TOOLS.md)，可合并的配置见 `examples/qq-tools.config.yaml`。开放群工具时，需要关闭实际主动参与或保持 dry-run。
 
 ## 5. 分层验收
 
@@ -237,8 +246,6 @@ uv run --no-project python scripts/publish_github.py --repo ii999/hermes-napcat
 
 脚本确认当前 gh 登录账号与仓库 owner 一致，初始化 `main`、只暂存项目文件，然后执行 `gh repo create --private --source ... --remote origin --push`。它拒绝更改已有 remote，不会覆盖现有仓库，不会创建公开仓库。已有仓库请自行检查 remote 并按常规 git 流程提交。组织仓库不在该脚本首版范围内。
 
-GitHub Actions 配置包含 Python 3.12/3.13 测试、静态检查和构建。本地生成源码包时并未运行远程 Actions。
-
 ## 开发与故障排查
 
 ```sh
@@ -249,4 +256,4 @@ uv build
 
 常见问题：能探测但 Agent 无回复时检查插件是否加载、profile 目录是否一致以及 `NAPCAT_ALLOWED_USERS`；收群消息但不触发时检查用户与群白名单、@目标和前缀边界；发送结果为 `delivery_uncertain` 时先检查 QQ 会话，避免手工重试重复发出；附件拒绝时检查域名、字节上限与共享挂载。日志不会主动输出原始消息或令牌，但部署者仍需限制日志访问并对上游错误做脱敏。
 
-[架构说明](docs/ARCHITECTURE.md) · [Agent QQ 工具](docs/QQ_TOOLS.md) · [上游兼容性](docs/COMPATIBILITY.md) · [安全边界](SECURITY.md) · [开发计划](docs/ROADMAP.md)
+[架构说明](docs/ARCHITECTURE.md) · [群聊上下文](docs/GROUP_CHAT.md) · [Agent QQ 工具](docs/QQ_TOOLS.md) · [上游兼容性](docs/COMPATIBILITY.md) · [安全边界](SECURITY.md) · [开发计划](docs/ROADMAP.md)
