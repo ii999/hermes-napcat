@@ -1,0 +1,36 @@
+# 合并到现有配置；不要覆盖模型、密钥、白名单和其他平台配置。
+group_sessions_per_user: true
+gateway:
+  platforms:
+    napcat:
+      extra:
+        # 仍需配置 allowed_groups / NAPCAT_ALLOWED_USERS。
+        group_toolsets: []
+        group_context:
+          enabled: true
+          observe_untriggered: true
+          # 群成员知晓数据用途后才能开启；不会扩大 Agent/工具调用权限。
+          observe_all_members: false
+          live_buffer_messages: 200
+          history_limit: 50
+          history_window_seconds: 1800
+          max_context_chars: 12000
+          history_backfill: true
+          backfill_timeout_seconds: 3
+          backfill_cooldown_seconds: 30
+          stop_at_last_bot_message: false
+        proactive_assist:
+          enabled: true
+          dry_run: true
+          quiet_window_ms: 2200
+          burst_window_seconds: 30
+          cooldown_seconds: 120
+          max_responses_per_hour: 4
+          max_decisions_per_hour: 30
+          confidence_threshold: 0.90
+          ignored_users: []
+          classifier:
+            enabled: false
+            base_url: http://127.0.0.1:8000/v1
+            model: ''
+            api_key_env: NAPCAT_CLASSIFIER_API_KEY

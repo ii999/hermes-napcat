@@ -2,7 +2,9 @@
 
 ## 模块职责
 
-`config.py` 校验配置并隐藏错误输入中的密钥；`protocol.py` 负责 OneBot 消息段、目标和标识符；`policy.py` 负责白名单、触发、限流和有界去重；`transport.py` 负责正反向 WebSocket、账号校验和 action/echo；`media.py` 负责下载与受控路径映射；`adapter.py` 构造 Hermes 事件并执行受控 QQ 动作；`tools.py` 绑定当前 session、校验工具参数并注册 `napcat_qq`；`plugin.py` 注册平台和主机驱动投递钩子；`cli.py` 提供人工诊断。
+`config.py` 校验配置并隐藏错误输入中的密钥；`protocol.py` 负责 OneBot 消息段、目标和标识符；`policy.py` 负责白名单、触发、限流和有界去重；`transport.py` 负责正反向 WebSocket、账号校验和 action/echo；`media.py` 负责下载与受控路径映射；`adapter.py` 构造 Hermes 事件并执行受控 QQ 动作；`tools.py` 绑定当前 session 并校验基础工具参数；`plugin.py` 注册平台和主机驱动投递钩子；`cli.py` 提供人工诊断。
+
+可选群聊层由 `group_adapter.py` 扩展基础适配器。`context.py` 保存有界观察记录，`group_chat.py` 负责观察、回填和调度，`engagement.py` 负责规则/无工具模型参与判断，`group_tools.py` 注册基础工具及近期群消息读取工具。后四个模块中的协议和调度逻辑不导入 Hermes；只有适配器和工具执行边界使用主机接口。
 
 目录插件 `plugin/__init__.py` 暴露 `register(ctx)`，`plugin/tools.py` 为 Hermes 的延迟平台加载器提供独立 `register_tools(ctx)`。实现代码装入 Hermes 的 Python 环境。工具发现不会导入 adapter 或连接 QQ；平台加载时重复注册采用 Hermes 的同一插件作用域。
 
@@ -10,11 +12,21 @@
 
 OneBot reader 先区分事件和 API 响应。建立连接后调用 `get_login_info`，核对预期机器人账号。账号确认前只临时缓存有界消息，错误账号不进入事件处理。响应在 reader 内按 echo 完成 Future，事件进入单独 worker，因而事件处理中调用 `get_msg` 等 API 不会阻塞响应 reader。
 
-worker 按聊天键顺序进入 adapter，跨聊天最多并行 event_workers 个。插件先检查账号、用户、群；再处理去重、限流和触发。群回复触发仅接受本进程记得的机器人消息，或通过 `get_msg` 验证同一群、机器人作者的消息。模型或用户提供的 quote sender 字段不能作为授权依据。
+基础模式下，worker 按聊天键顺序进入 adapter，跨聊天最多并行 event_workers 个。插件先检查账号、用户、群；再处理去重、限流和触发。群回复触发仅接受本进程记得的机器人消息，或通过 `get_msg` 验证同一群、机器人作者的消息。模型或用户提供的 quote sender 字段不能作为授权依据。
 
 插件随后处理允许的媒体并调用 `build_source()`，保留用户身份、聊天类型、消息 ID 和账号 scope 元数据，通过 `handle_message()` 交给 Hermes。用户/群 ID 不复用同一裸数字地址。实际会话键、profile 路由、memory、模型调用及 cron 调度由 Hermes 负责。多个机器人账号应分配独立 profile；不依赖未验证的跨账号 session-key 推断。
 
 网关鉴权仍然启用。插件不会设置 `internal=True` 或伪造 `role_authorized=True`。非管理员事件设置 `allow_gateway_control=False`。群聊工具集默认用空列表覆盖；私聊使用 Hermes 平台工具配置。
+
+## 可选群聊上下文与参与
+
+启用 `group_context` 后，群消息先进入独立的观察控制器。观察缓存只保留有界文本、发言人、时间、引用及附件类型；执行队列另行处理获准用户的直接请求，等待模型期间仍能观察新消息。默认只观察授权用户，管理员可单独开启 `observe_all_members`，但观察权限不会授予 Agent 或工具权限。
+
+被点名时，控制器按需通过已有 WebSocket 查询近期历史、校验同群归属和引用来源，再以 `MessageEvent.channel_context` 注入本轮背景。它保留真实 `source.user_id`、当前文本和账号 scope，不把个人会话合并为共享群会话，也不将历史逐条重放成命令。连接变化或事件缺口会触发受限回填，无法保证完整恢复离线期间的消息。
+
+`proactive_assist` 默认关闭，启用后默认 dry-run。控制器合并同一发言人的连续短句，等待静默窗口，以规则或独立无工具分类器决定是否参与，并限制冷却、模型判断次数和发言次数。实际主动回复要求 `group_toolsets: []`，继续使用获准发言人的真实身份且关闭网关控制权限。第一段发送前再次核对群状态与过期时间，发送开始后保留原有部分成功和不确定投递语义。
+
+启用后的 `group_recall` 通知会移除缓存并创建有界 tombstone，防止回填恢复已撤回文本。已提交给 Hermes 或模型提供方的内容无法靠缓存撤回收回。配置、数据保留和实际环境验收边界见 [GROUP_CHAT](GROUP_CHAT.md)。
 
 ## 发送语义
 
@@ -28,9 +40,9 @@ worker 按聊天键顺序进入 adapter，跨聊天最多并行 event_workers �
 
 插件注册 Hermes 的 `parse_target_ref_fn`、`validate_target_ref_fn`、`cron_deliver_env_var` 和 `standalone_sender_fn`，由主机驱动发送。独立 sender 建立只发不处理事件的正向连接，结束后关闭资源。反向模式需要已经运行的 Gateway，独立 sender 返回明确错误。
 
-`napcat_qq` 只暴露五个有界工具，不提供任意 OneBot action 透传。handler 从 Hermes `gateway.session_context` 读取当前 platform、chat、user、profile 和 message ID，再从正在运行的 Gateway 解析该 profile 自己的 adapter。非 NapCat turn、无实时 Gateway 或 profile 没有 adapter 时均失败关闭。
+`napcat_qq` 暴露六个有界工具，包括需要启用群聊上下文的 `qq_get_recent_messages`，不提供任意 OneBot action 透传。handler 从 Hermes `gateway.session_context` 读取当前 platform、chat、user、profile 和 message ID，再从正在运行的 Gateway 解析该 profile 自己的 adapter。非 NapCat turn、无实时 Gateway 或 profile 没有 adapter 时均失败关闭。
 
-工具目标默认固定为当前会话。跨会话需要配置显式开启、当前用户属于 `admins`、目标通过 adapter 白名单三项条件。群消息引用通过 `group_id` 核验；私聊引用只接受目标联系人发来的消息、当前入站消息，或本进程按目标记住的机器人消息。读取工具只返回有界文本、发送者和附件类型，不返回媒体 URL 或原始事件。
+工具目标默认固定为当前会话。跨会话需要配置显式开启、当前用户属于 `admins`、目标通过 adapter 白名单三项条件。群消息引用通过 `group_id` 核验；私聊引用只接受目标联系人发来的消息、当前入站消息，或本进程按目标记住的机器人消息。读取工具只返回有界文本、发送者和附件类型，不返回媒体 URL 或原始事件；近期消息工具另返回时间、引用及窗口状态。
 
 模型提供的媒体 URL 先走 `MediaStore`，不会直接交给 NapCat 下载。本地路径仍受 `outbound_roots`、真实路径解析、工具字节上限和共享路径映射约束。合并转发先核验全部已有消息节点，再下载自建节点媒体，最后执行一次发送，避免验证中途产生不可逆动作。自建节点使用机器人 QQ 号，模型只能设置显示标签。
 
@@ -48,4 +60,4 @@ worker 按聊天键顺序进入 adapter，跨聊天最多并行 event_workers �
 
 forward start 等待账号验证，reverse start 等待监听成功。反向监听就绪与 QQ 连接就绪分开看待；CLI probe 会等待账号验证。forward 重连在传输层内部进行，Gateway 的静态连接状态不代表实时 QQ 登录状态，需要结合探测和日志。
 
-停止时清理待响应 Future、worker、reader、HTTP session、反向监听和队列。事件队列满会记录丢弃计数和日志；内存去重在进程退出后丢失。首版不引入数据库、RabbitMQ 或额外 Web 服务，降低部署复杂度；可靠事件存档是后续扩展。
+停止时清理待响应 Future、worker、reader、HTTP session、反向监听和队列。可选群聊层还清理计时器、群请求任务、分类器连接及内存观察缓存。事件队列满会记录丢弃计数和日志；内存去重在进程退出后丢失。当前实现不引入数据库、RabbitMQ 或额外 Web 服务；可靠事件存档是后续扩展。

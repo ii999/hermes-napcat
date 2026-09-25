@@ -118,6 +118,75 @@ class QQToolsSettings(StrictModel):
     )
 
 
+class GroupContextSettings(StrictModel):
+    """Opt-in, bounded public group context, separate from Hermes sessions."""
+
+    enabled: bool = False
+    observe_untriggered: bool = True
+    observe_all_members: bool = False
+    live_buffer_messages: int = Field(default=200, ge=10, le=2000)
+    max_groups: int = Field(default=64, ge=1, le=256)
+    max_message_chars: int = Field(default=4000, ge=200, le=16000)
+    max_context_chars: int = Field(default=12000, ge=1000, le=64000)
+    history_limit: int = Field(default=50, ge=1, le=100)
+    history_window_seconds: int = Field(default=1800, ge=30, le=86400)
+    history_backfill: bool = True
+    backfill_timeout_seconds: float = Field(default=3, gt=0, le=30)
+    backfill_cooldown_seconds: float = Field(default=30, ge=1, le=3600)
+    stop_at_last_bot_message: bool = False
+    max_pending_messages: int = Field(default=32, ge=1, le=256)
+    observation_messages_per_minute: int = Field(default=120, ge=1, le=1200)
+
+
+class ClassifierSettings(StrictModel):
+    """An operator-configured, tool-free chat-completions classifier."""
+
+    enabled: bool = False
+    base_url: str = "http://127.0.0.1:8000/v1"
+    model: str = ""
+    api_key_env: str = "NAPCAT_CLASSIFIER_API_KEY"
+    timeout_seconds: float = Field(default=8, gt=0, le=30)
+    allow_insecure_http: bool = False
+
+    @model_validator(mode="after")
+    def validate_endpoint(self):
+        url = urlsplit(self.base_url)
+        if (url.scheme not in ("http", "https") or not url.hostname or url.username or
+                url.password or url.query or url.fragment):
+            raise ValueError("classifier.base_url must be an http(s) endpoint without credentials")
+        _ = url.port
+        if url.scheme == "http" and not loopback(url.hostname) and not self.allow_insecure_http:
+            raise ValueError("remote classifier HTTP requires allow_insecure_http=true")
+        if self.enabled and not self.model.strip():
+            raise ValueError("classifier.model is required when enabled")
+        if (not self.api_key_env.startswith("NAPCAT_CLASSIFIER_") or
+                not self.api_key_env.replace("_", "").isalnum() or
+                not self.api_key_env.isascii()):
+            raise ValueError("use a dedicated NAPCAT_CLASSIFIER_* secret")
+        return self
+
+
+class ProactiveSettings(StrictModel):
+    enabled: bool = False
+    dry_run: bool = True
+    quiet_window_ms: int = Field(default=2200, ge=100, le=30000)
+    burst_window_seconds: int = Field(default=30, ge=1, le=120)
+    confidence_threshold: float = Field(default=0.90, ge=0.5, le=1, allow_inf_nan=False)
+    cooldown_seconds: float = Field(default=120, ge=1, le=3600)
+    max_responses_per_hour: int = Field(default=4, ge=1, le=60)
+    max_decisions_per_hour: int = Field(default=30, ge=1, le=600)
+    max_reply_age_seconds: float = Field(default=90, ge=5, le=300)
+    ignored_users: tuple[str, ...] = ()  # Explicit sibling-bot IDs; QQ has no reliable is_bot flag.
+    classifier: ClassifierSettings = Field(default_factory=ClassifierSettings)
+
+    @field_validator("ignored_users", mode="before")
+    @classmethod
+    def normalize_ignored(cls, value):
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("use a YAML list for proactive ignored_users")
+        return tuple(dict.fromkeys(numeric_id(item) for item in value))
+
+
 class Settings(StrictModel):
     self_id: str
     token: SecretStr
@@ -151,6 +220,8 @@ class Settings(StrictModel):
     group_toolsets: tuple[str, ...] = ()
     media: MediaSettings = Field(default_factory=MediaSettings)
     qq_tools: QQToolsSettings = Field(default_factory=QQToolsSettings)
+    group_context: GroupContextSettings = Field(default_factory=GroupContextSettings)
+    proactive_assist: ProactiveSettings = Field(default_factory=ProactiveSettings)
 
     @field_validator("self_id", mode="before")
     @classmethod
@@ -181,6 +252,13 @@ class Settings(StrictModel):
 
     @model_validator(mode="after")
     def validate_transport(self):
+        if self.group_context.enabled and len(self.allowed_groups) > self.group_context.max_groups:
+            raise ValueError("allowed_groups exceeds group_context.max_groups")
+        if self.proactive_assist.enabled:
+            if not self.group_context.enabled or not self.group_context.observe_untriggered:
+                raise ValueError("proactive assist requires enabled live group context")
+            if not self.proactive_assist.dry_run and self.group_toolsets:
+                raise ValueError("live proactive assist requires group_toolsets=[]")
         parsed = urlsplit(self.ws_url)
         if (parsed.scheme not in ("ws", "wss") or not parsed.hostname or parsed.username or
                 parsed.password or parsed.query or parsed.fragment):
