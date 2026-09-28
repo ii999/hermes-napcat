@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -11,8 +12,15 @@ from gateway.platforms.event import MessageEvent, MessageType
 from .adapter import NapCatAdapter
 from .context import _timestamp
 from .group_chat import GroupChatController, GroupTurn
-from .protocol import Target, message_id
+from .protocol import Incoming, Target, message_id
 from .transport import DeliveryUncertain
+
+
+@dataclass
+class _ProcessingTurn:
+    turn: GroupTurn
+    finished: asyncio.Future
+    task: asyncio.Task | None = None
 
 
 class GroupNapCatAdapter(NapCatAdapter):
@@ -24,6 +32,7 @@ class GroupNapCatAdapter(NapCatAdapter):
             self._classifier_key = get_scoped_secret(
                 self.settings.proactive_assist.classifier.api_key_env, "") or ""
         self.groups = self._group_controller()
+        self._processing_turns: dict[int, _ProcessingTurn] = {}
 
     def _group_controller(self) -> GroupChatController:
         return GroupChatController(
@@ -31,7 +40,44 @@ class GroupNapCatAdapter(NapCatAdapter):
             lambda action, params: self.transport.call(action, params), self._dispatch_group,
             transport_state=lambda: (self.transport.connection_epoch, self.transport.stats.dropped),
             classifier_key=self._classifier_key,
+            is_control_reply=self._is_control_reply,
         )
+
+    def _is_control_reply(self, incoming: Incoming, text: str) -> bool:
+        source = self.build_source(
+            chat_id=incoming.target.address, chat_type="group", user_id=incoming.user_id,
+            user_name=incoming.user_name, message_id=incoming.message_id,
+            scope_id=self.settings.self_id,
+        )
+        event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
+        command = event.get_command()
+        if command:
+            from hermes_cli.commands import should_bypass_active_session
+
+            return should_bypass_active_session(command)
+        if not self.settings.group_toolsets:
+            return False
+        from tools.clarify_gateway import get_pending_for_session
+
+        return get_pending_for_session(
+            self._event_session_key(event), include_choice_prompts=True) is not None
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        processing = self._processing_turns.get(id(event))
+        # Queued Hermes events inherit the preceding task's context. Bind this event explicitly.
+        self.groups.activate_turn(processing.turn if processing else None)
+        if processing is not None:
+            if self.groups.closed:
+                raise asyncio.CancelledError
+            processing.task = asyncio.current_task()
+
+            def finished(task: asyncio.Task) -> None:
+                self._processing_turns.pop(id(event), None)
+                if not processing.finished.done():
+                    processing.finished.set_result(None)
+
+            processing.task.add_done_callback(finished)
+        await super().on_processing_start(event)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if self.groups.closed:
@@ -40,6 +86,14 @@ class GroupNapCatAdapter(NapCatAdapter):
 
     async def disconnect(self) -> None:
         await self.groups.close()
+        tasks = [state.task for state in self._processing_turns.values() if state.task is not None]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for state in self._processing_turns.values():
+            state.finished.cancel()
+        self._processing_turns.clear()
         await super().disconnect()
 
     async def _receive(self, raw: dict[str, Any]) -> None:
@@ -113,7 +167,21 @@ class GroupNapCatAdapter(NapCatAdapter):
             allow_gateway_control=not turn.proactive and incoming.user_id in self.settings.admins,
             metadata={"napcat_self_id": self.settings.self_id, "napcat_proactive": turn.proactive},
         )
-        await self.handle_message(event)
+        if turn.inline:
+            await self.handle_message(event)
+            return
+        processing = _ProcessingTurn(turn, asyncio.get_running_loop().create_future())
+        self._processing_turns[id(event)] = processing
+        try:
+            await self.handle_message(event)
+            if getattr(event, "_gateway_accepted", False):
+                await asyncio.shield(processing.finished)
+            else:
+                self._processing_turns.pop(id(event), None)
+        except BaseException:
+            if not getattr(event, "_gateway_accepted", False):
+                self._processing_turns.pop(id(event), None)
+            raise
 
     async def _send_action_with_id(self, target: Target, action: str,
                                    params: dict[str, Any]) -> str:

@@ -30,6 +30,8 @@ class GroupTurn:
     context: str | None = None
     quote: GroupMessage | None = None
     proactive: bool = False
+    ticket: ProactiveTicket | None = None
+    inline: bool = False
 
 
 @dataclass
@@ -45,11 +47,14 @@ class GroupChatController:
                  call: Callable[..., Awaitable[Any]],
                  dispatch: Callable[[GroupTurn], Awaitable[None]], *,
                  transport_state: Callable[[], tuple[int, int]] = lambda: (0, 0),
-                 classifier_key: str = ""):
+                 classifier_key: str = "",
+                 is_control_reply: Callable[[Incoming, str], bool] = (
+                     lambda incoming, text: text.lstrip().startswith("/"))):
         self.settings, self.policy, self.call, self.dispatch = settings, policy, call, dispatch
         self.config, self.proactive = settings.group_context, settings.proactive_assist
         self.context = GroupContext(settings, policy)
         self.transport_state = transport_state
+        self.is_control_reply = is_control_reply
         self.classifier = ParticipationClassifier(self.proactive.classifier, classifier_key)
         self.seen = RecentIDs(settings.dedup_capacity, settings.dedup_ttl)
         self._negative_quotes = RecentIDs(settings.dedup_capacity, 30)
@@ -69,6 +74,7 @@ class GroupChatController:
         self._pending = 0
         self._closed = False
         self._model_slots = asyncio.Semaphore(settings.event_workers)
+        self._turn_locks = {f"group:{group}": asyncio.Lock() for group in settings.allowed_groups}
         self._classifier_slot = asyncio.Semaphore(1)
         self._ticket: ContextVar[ProactiveTicket | None] = ContextVar("napcat_proactive", default=None)
         self.stats = {key: 0 for key in (
@@ -145,10 +151,11 @@ class GroupChatController:
                 self.stats["observation_dropped"] += 1
         if not authorized:
             return
-        if direct is not None and direct.lstrip().startswith("/") and incoming.user_id in self.settings.admins:
+        if (direct is not None and incoming.user_id in self.settings.admins
+                and self.is_control_reply(incoming, direct)):
             # Do not queue /stop behind a slow model turn. Preserve the genuine principal.
             if self.policy.rate_allowed(incoming) and len(self._controls) < self.config.max_pending_messages:
-                task = asyncio.create_task(self._dispatch_control(GroupTurn(incoming, direct)))
+                task = asyncio.create_task(self._dispatch_control(GroupTurn(incoming, direct, inline=True)))
                 self._controls.add(task)
                 task.add_done_callback(self._controls.discard)
             return
@@ -286,16 +293,17 @@ class GroupChatController:
             if (old_state == state and room.history_status in ("fetched_window", "filtered_window")
                     and self.config.observe_untriggered and not room.gap):
                 return
-        task = self._fetches.get(address)
-        if task is None:
-            self._bounded_set(self._fetch_state, address, (state, time.monotonic()))
-            task = asyncio.create_task(self._fetch_page(target, anchor))
-            self._fetches[address] = task
-        try:
-            await asyncio.shield(task)
-        finally:
-            if task.done() and self._fetches.get(address) is task:
+        self._bounded_set(self._fetch_state, address, (state, time.monotonic()))
+        task = asyncio.create_task(self._fetch_page(target, anchor))
+        self._fetches[address] = task
+
+        def finished(completed: asyncio.Task) -> None:
+            # The query outlives a cancelled waiter; its completion owns cleanup.
+            if self._fetches.get(address) is completed:
                 self._fetches.pop(address, None)
+
+        task.add_done_callback(finished)
+        await asyncio.shield(task)
 
     async def _addressed(self, incoming: Incoming) -> None:
         address = incoming.target.address
@@ -312,7 +320,7 @@ class GroupChatController:
             return
         self._bounded_set(self._cooldowns, address, time.monotonic())
         self._cancel_timer(address)
-        async with self._model_slots:
+        async with self._turn_locks[address], self._model_slots:
             await self.ensure_history(incoming.target, incoming.message_id)
             quote = quote or await self._quote(incoming)
             own_reply = own_reply or bool(quote and quote.own)
@@ -326,7 +334,7 @@ class GroupChatController:
         current_task = asyncio.current_task()
         try:
             await asyncio.sleep(self.proactive.quiet_window_ms / 1000)
-            if self._closed or address in self._workers:
+            if self._closed or address in self._workers or self._turn_locks[address].locked():
                 return
             last = self._cooldowns.get(address, float("-inf"))
             if time.monotonic() - last < self.proactive.cooldown_seconds:
@@ -360,7 +368,7 @@ class GroupChatController:
                 return
             if not self.policy.rate_allowed(incoming):
                 return
-            async with self._model_slots:
+            async with self._turn_locks[address], self._model_slots:
                 if revision != self.context.room(address).revision:
                     return
                 ticket = ProactiveTicket(address, revision,
@@ -373,7 +381,8 @@ class GroupChatController:
                     if self._timers.get(address) is current_task:
                         self._timers.pop(address, None)
                     self._proactive_runs.add(current_task)
-                    await self.dispatch(GroupTurn(incoming, candidate.text, context=context, proactive=True))
+                    await self.dispatch(GroupTurn(incoming, candidate.text, context=context,
+                                                  proactive=True, ticket=ticket))
                 finally:
                     self._ticket.reset(token)
                     self._proactive_runs.discard(current_task)
@@ -385,6 +394,10 @@ class GroupChatController:
         finally:
             if self._timers.get(address) is current_task:
                 self._timers.pop(address, None)
+
+    def activate_turn(self, turn: GroupTurn | None) -> None:
+        """Bind the actual host processing task, including tasks drained from its queue."""
+        self._ticket.set(turn.ticket if turn is not None else None)
 
     def before_send(self, target: Target) -> None:
         ticket = self._ticket.get()

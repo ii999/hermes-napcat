@@ -1,5 +1,6 @@
 """Actual plugin wiring with the repository's Hermes doubles, not a real Gateway run."""
 import asyncio
+import contextvars
 import importlib
 import json
 import sys
@@ -110,3 +111,123 @@ def test_plugin_registers_group_adapter_and_deferred_recent_tool(hermes_doubles,
     assert any(row['name'] == 'qq_get_recent_messages' for row in tool_calls)
     assert platform_calls[0]['adapter_factory'] is type(group_adapter())
     assert platform_calls[0]['allowed_users_env'] == 'NAPCAT_ALLOWED_USERS'
+
+
+def background_gateway(adapter, run, *, context=None):
+    """Simulate Hermes admission and lifecycle hooks, including a separate task context."""
+    async def admit(event):
+        event._gateway_accepted = True
+
+        async def process():
+            await adapter.on_processing_start(event)
+            await run(event)
+
+        asyncio.create_task(process(), context=context() if context else contextvars.Context())
+
+    adapter.handle_message.side_effect = admit
+
+
+async def test_background_turns_hold_group_order_and_model_slots_but_allow_controls(group_adapter):
+    adapter = group_adapter(event_workers=1, allowed_groups=['300', '301'])
+    entered, release, stopped = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    delivered = []
+
+    async def run(event):
+        delivered.append(event.text)
+        if event.text == 'slow':
+            entered.set()
+            await release.wait()
+        if event.text == '/stop':
+            stopped.set()
+
+    background_gateway(adapter, run)
+    await adapter._receive(event(1, text='slow', parts=[MENTION]))
+    await asyncio.wait_for(entered.wait(), 1)
+    await adapter._receive(event(2, text='next', parts=[MENTION]))
+    await adapter._receive(event(3, group=301, text='other', parts=[MENTION]))
+    await adapter._receive(event(4, user=201, text='observation'))
+    await adapter._receive(event(5, text='/stop', parts=[MENTION]))
+    await adapter._receive(event(6, text='/unknown', parts=[MENTION]))
+    await asyncio.wait_for(stopped.wait(), 1)
+    assert delivered == ['slow', '/stop']
+    assert adapter.groups.context.lookup('group:300', '4').text == 'observation'
+    release.set()
+    await asyncio.wait_for(adapter.groups.wait_idle(), 1)
+    assert sorted(delivered) == ['/stop', '/unknown', 'next', 'other', 'slow']
+    await adapter.disconnect()
+
+
+async def test_background_tasks_bind_their_own_proactive_ticket(group_adapter):
+    adapter = group_adapter(proactive_assist={
+        'enabled': True, 'dry_run': False, 'quiet_window_ms': 100,
+    })
+    entered, release = asyncio.Event(), asyncio.Event()
+    inherited = [contextvars.Context()]
+    delivered = []
+
+    async def run(message):
+        target = Target.parse(message.source.chat_id)
+        if message.metadata['napcat_proactive']:
+            inherited[0] = contextvars.copy_context()
+            entered.set()
+            await release.wait()
+            with pytest.raises(PermissionError):
+                adapter.groups.before_send(target)
+            delivered.append('stale suppressed')
+        else:
+            adapter.groups.before_send(target)
+            delivered.append(message.text)
+
+    background_gateway(adapter, run, context=lambda: inherited[0].copy())
+    await adapter._receive(event(1, text='有人知道怎么解决吗？'))
+    await asyncio.wait_for(entered.wait(), 1)
+    await adapter._receive(event(2, text='explicit reply', parts=[MENTION]))
+    release.set()
+    await asyncio.wait_for(adapter.groups.wait_idle(), 1)
+    assert delivered == ['stale suppressed', 'explicit reply']
+    await adapter.disconnect()
+
+
+async def test_clarification_reply_bypasses_the_waiting_group_turn(group_adapter, monkeypatch):
+    adapter = group_adapter(group_toolsets=['clarify'])
+    entered, answered = asyncio.Event(), asyncio.Event()
+    pending = []
+    clarify = SimpleNamespace(get_pending_for_session=lambda key, **kw: pending or None)
+    monkeypatch.setitem(sys.modules, 'tools', SimpleNamespace(clarify_gateway=clarify))
+    monkeypatch.setitem(sys.modules, 'tools.clarify_gateway', clarify)
+    adapter._event_session_key = lambda message: message.source.user_id
+
+    async def run(message):
+        if message.text == 'question':
+            pending.append(message)
+            entered.set()
+            await answered.wait()
+        elif message.text == '2':
+            pending.clear()
+            answered.set()
+
+    background_gateway(adapter, run)
+    await adapter._receive(event(1, text='question', parts=[MENTION]))
+    await asyncio.wait_for(entered.wait(), 1)
+    await adapter._receive(event(2, text='2', parts=[MENTION]))
+    await asyncio.wait_for(adapter.groups.wait_idle(), 1)
+    assert answered.is_set()
+    await adapter.disconnect()
+
+
+async def test_disconnect_cancels_background_group_processing(group_adapter):
+    adapter = group_adapter()
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def run(message):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    background_gateway(adapter, run)
+    await adapter._receive(event(1, parts=[MENTION]))
+    await asyncio.wait_for(entered.wait(), 1)
+    await adapter.disconnect()
+    assert cancelled.is_set()

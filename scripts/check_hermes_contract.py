@@ -19,14 +19,23 @@ def main() -> None:
     from gateway.platforms.event import MessageEvent
     from gateway.session_context import get_session_env
     from hermes_cli.plugins import PluginContext
-    from hermes_napcat.adapter import NapCatAdapter
+    from hermes_cli.commands import should_bypass_active_session
+    from tools.clarify_gateway import get_pending_for_session
+    from hermes_napcat.group_adapter import GroupNapCatAdapter
     from hermes_napcat.plugin import register
 
-    assert issubclass(NapCatAdapter, BasePlatformAdapter)
-    assert not inspect.isabstract(NapCatAdapter), NapCatAdapter.__abstractmethods__
+    assert issubclass(GroupNapCatAdapter, BasePlatformAdapter)
+    assert not inspect.isabstract(GroupNapCatAdapter), GroupNapCatAdapter.__abstractmethods__
     assert "extra" in inspect.signature(PlatformConfig).parameters
-    assert "allow_gateway_control" in inspect.signature(MessageEvent).parameters
+    assert {
+        "allow_gateway_control", "channel_context", "channel_prompt",
+        "reply_to_author_id", "reply_to_author_name", "reply_to_is_own_message",
+    }.issubset(inspect.signature(MessageEvent).parameters)
     assert "scope_id" in inspect.signature(BasePlatformAdapter.build_source).parameters
+    assert "event" in inspect.signature(BasePlatformAdapter.on_processing_start).parameters
+    assert "event" in inspect.signature(BasePlatformAdapter._event_session_key).parameters
+    assert callable(should_bypass_active_session)
+    assert "include_choice_prompts" in inspect.signature(get_pending_for_session).parameters
     assert "profile" in inspect.signature(GatewayAuthorizationMixin._authorization_adapter).parameters
     assert callable(get_session_env)
     tool_parameters = inspect.signature(PluginContext.register_tool).parameters
@@ -43,7 +52,7 @@ def main() -> None:
     assert entries[0].check_fn()
     assert {item["name"] for item in tools} == {
         "qq_send_message", "qq_send_media", "qq_send_forward", "qq_get_message",
-        "qq_get_chat_info",
+        "qq_get_chat_info", "qq_get_recent_messages",
     }
     assert all(item["toolset"] == "napcat_qq" and item["is_async"] for item in tools)
     print("PASS: real Hermes imports, adapter contract, platform and QQ tool registration")

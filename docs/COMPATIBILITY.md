@@ -27,6 +27,8 @@
 
 0.2.0 的五个 QQ 工具通过公开 `ctx.register_tool()` 注册，并在 `plugin.yaml` 声明 `provides_tools`，适配 Hermes 的 deferred platform loading。handler 使用 `gateway.session_context.get_session_env()` 取得 task-local 来源。为了把 action 调度到持有 WebSocket 的 Gateway loop，并按 profile 选择正确 adapter，当前实现还读取 `gateway.run._gateway_runner_ref` 并调用 runner 的 `_authorization_adapter()`；这两个运行时入口属于 Hermes 内部接口。`scripts/check_hermes_contract.py` 会检查本版依赖的形状，但升级 Hermes 后仍必须执行真实工具调用验收。
 
+启用群聊上下文后增加第六个工具 `qq_get_recent_messages`。群调度使用 `on_processing_start()` 跟踪后台任务，并读取 Hermes 的内部入队标记 `_gateway_accepted`；控制命令绕行调用 `should_bypass_active_session()`，澄清回答通过 `_event_session_key()` 与 `tools.clarify_gateway.get_pending_for_session()` 匹配当前会话。升级 Hermes 时需复核这些接口。后台排队、任务上下文切换和关闭取消有模拟测试覆盖，尚未完成真实 Hermes Gateway 联调。
+
 ## NapCat
 
 网络 schema 与客户端代码核验的是 2026-09-18 获取的 main，不把它当作已在某个发行版上完成实机测试：

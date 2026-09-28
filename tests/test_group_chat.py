@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -141,6 +142,44 @@ async def test_reconnect_and_drop_state_request_bounded_backfill_again():
     ctl._fetch_state[target.address] = ((1, 0), time.monotonic() - 31)
     await ctl.ensure_history(target)
     assert ctl.call.await_count == 2 and ctl.context.room(target.address).gap
+    await ctl.close()
+
+
+@pytest.mark.parametrize("join_inflight", [False, True])
+async def test_cancelled_history_waiter_does_not_disable_future_backfill(monkeypatch, join_inflight):
+    from hermes_napcat import group_chat
+
+    clock = [0.0]
+    monkeypatch.setattr(group_chat, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    entered, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    state = [1, 0]
+
+    async def fetch(action, params):
+        entered.set()
+        await release.wait()
+        finished.set()
+        return {"messages": [event(state[0], text=f"epoch {state[0]}")]}
+
+    ctl = controller(call=fetch, state=lambda: tuple(state))
+    target = Target.parse("group:300")
+    waiter = asyncio.create_task(ctl.ensure_history(target))
+    await asyncio.wait_for(entered.wait(), 1)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    joined = asyncio.create_task(ctl.ensure_history(target)) if join_inflight else None
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.wait_for(finished.wait(), 1)
+    if joined is not None:
+        await joined
+    await asyncio.sleep(0)
+    assert ctl.context.lookup(target.address, "1").text == "epoch 1"
+
+    clock[0] = 31.0
+    state[:] = [2, 1]
+    await ctl.ensure_history(target)
+    assert ctl.context.lookup(target.address, "2").text == "epoch 2"
     await ctl.close()
 
 
