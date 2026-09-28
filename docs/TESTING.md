@@ -28,8 +28,6 @@ Agent QQ 工具测试覆盖图文顺序和引用核验、跨会话的开关/管�
 
 真实 Hermes 源码检查使用 `v2026.9.14`（0.21.3），验证 adapter 非抽象、平台注册、五个工具注册、session context API 和按 profile 解析 adapter 所需的接口形状。该检查导入真实 Hermes 模块，但不启动 Gateway 或 QQ。
 
-发布脚本测试模拟 gh/git 命令结果，核验账号限制、private 默认、已有 remote 拒绝、显式暂存目录、无嵌套 shell 和 github.com 主机选择。这些测试没有调用真实 GitHub 写接口。
-
 ## 未执行
 
 当前容器没有完整 Hermes 安装、已登录 QQ 的 NapCat 或用户模型凭据。没有执行真实 Hermes 插件加载、完整 Gateway、模型/Memory/Skills、cron、STT/TTS 和 QQ 的端到端验收。接口替身测试和源码核验不能替代这些验收。

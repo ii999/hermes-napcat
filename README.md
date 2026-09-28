@@ -28,7 +28,7 @@ QQ ↔ NapCat ↔ OneBot v11 WebSocket ↔ napcat 插件 ↔ Hermes Gateway ↔ 
 | Agent QQ 工具 | 可选 `napcat_qq` 工具集：图文/媒体发送、引用、合并转发、单条消息与会话信息读取，新增有界 `qq_get_recent_messages` |
 | 权限 | 网关控制指令限 `admins`；群聊默认无模型工具；观察权限不授予执行权限；实际主动回复要求无工具群会话；发送目标也检查白名单 |
 | 主动推送 | 注册原生目标解析与 cron standalone sender；独立进程仅支持正向连接的文本推送 |
-| 运维 | 配置检查、连接探测、人工测试发送、安装脚本、私有 GitHub 仓库发布脚本 |
+| 运维 | 配置检查、连接探测、人工测试发送、安装脚本 |
 
 本版不包含 QQ 群管理/空间工具集、持久群历史存档、Relay、持久消息队列、跨机器大文件流式上传或语音转码。音频能否进入 Hermes STT、音视频能否在 QQ 播放，还取决于实际格式与运行环境。Agent 工具默认关闭，配置方法见 [Agent QQ 工具](docs/QQ_TOOLS.md)。开发计划见 [ROADMAP](docs/ROADMAP.md)。
 
@@ -232,19 +232,6 @@ media:
 这两条路径必须由你挂载到同一存储内容。插件只做路径映射，不负责同步和挂载。NapCat 应对共享目录只读。文件上传使用 `upload_group_file`/`upload_private_file`；图片、语音和视频使用结构化 `file` 消息段。共享路径发送不会把整个文件读取为 base64。路径不存在、越界或符号链接指向允许目录外时，插件拒绝发送。
 
 收到的 `file:///...` 或消息中的本地路径不会直接打开。语音/视频缺少可下载 URL、SILK 等格式需要额外解码、文件事件需要 NapCat 扩展查询时，本版会保留未读取说明，不能假装读到了附件。
-
-## 8. 创建私有 GitHub 仓库
-
-本项目附带人工运行的发布脚本。它要求本机已安装 GitHub CLI 和 git，不会读取聊天中的 token，也不会修改全局 git 身份。
-
-在解压后的项目目录执行：
-
-```sh
-gh auth login --hostname github.com --scopes workflow
-uv run --no-project python scripts/publish_github.py --repo ii999/hermes-napcat
-```
-
-脚本确认当前 gh 登录账号与仓库 owner 一致，初始化 `main`、只暂存项目文件，然后执行 `gh repo create --private --source ... --remote origin --push`。它拒绝更改已有 remote，不会覆盖现有仓库，不会创建公开仓库。已有仓库请自行检查 remote 并按常规 git 流程提交。组织仓库不在该脚本首版范围内。
 
 ## 开发与故障排查
 
