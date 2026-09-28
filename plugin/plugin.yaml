@@ -10,6 +10,7 @@ provides_tools:
   - qq_send_forward
   - qq_get_message
   - qq_get_chat_info
+  - qq_get_recent_messages
 requires_env:
   - name: NAPCAT_TOKEN
     description: OneBot WebSocket access token (not the NapCat WebUI token)
@@ -27,3 +28,6 @@ optional_env:
   - name: NAPCAT_HOME_CHANNEL
     description: Default delivery target, private:QQ or group:ID
     password: false
+  - name: NAPCAT_CLASSIFIER_API_KEY
+    description: Optional separate key for the tool-free group participation classifier
+    password: true

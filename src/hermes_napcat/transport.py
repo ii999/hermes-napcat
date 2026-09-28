@@ -80,6 +80,11 @@ class OneBotTransport:
         return self.ready.is_set() and self._ws is not None and not self._ws.closed
 
     @property
+    def connection_epoch(self) -> int:
+        """Changes for each socket attachment; consumers use it to detect history gaps."""
+        return self._epoch
+
+    @property
     def pending_count(self) -> int:
         return len(self._pending)
 
@@ -260,7 +265,9 @@ class OneBotTransport:
                     future.set_result(payload)
                 else:
                     self.stats.late_responses += 1
-            elif payload.get("post_type") == "message":
+            elif (payload.get("post_type") == "message" or (
+                    self.config.group_context.enabled and payload.get("post_type") == "notice"
+                    and payload.get("notice_type") == "group_recall")):
                 if validated.is_set():
                     self._enqueue(payload)
                 elif len(preauth) < self.config.event_queue_size:
@@ -282,7 +289,8 @@ class OneBotTransport:
         while True:
             event = await self._queue.get()
             # Serialize adapter admission per conversation, without blocking the WS response reader.
-            kind = event.get("message_type")
+            kind = ("group" if event.get("notice_type") == "group_recall"
+                    else event.get("message_type"))
             key = f"{kind}:{event.get('group_id') if kind == 'group' else event.get('user_id')}"
             lock, count = self._chat_locks.get(key, (asyncio.Lock(), 0))
             self._chat_locks[key] = (lock, count + 1)

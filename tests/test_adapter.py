@@ -139,6 +139,6 @@ def test_plugin_registration_exposes_gateway_hooks_and_qq_tools(hermes_doubles):
     assert captured["parse_target_ref_fn"]("private:200") == ("private:200", None)
     assert {item["name"] for item in registered_tools} == {
         "qq_send_message", "qq_send_media", "qq_send_forward", "qq_get_message",
-        "qq_get_chat_info",
+        "qq_get_chat_info", "qq_get_recent_messages",
     }
     assert all(item["toolset"] == "napcat_qq" for item in registered_tools)

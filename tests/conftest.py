@@ -71,7 +71,9 @@ def hermes_doubles(monkeypatch, tmp_path):
         DOCUMENT = "document"
 
     class MessageEvent(SimpleNamespace):
-        pass
+        def get_command(self):
+            text = self.text.lstrip()
+            return text.split()[0][1:].lower() if text.startswith("/") else None
 
     class BasePlatformAdapter:
         def __init__(self, config, platform):
@@ -89,6 +91,9 @@ def hermes_doubles(monkeypatch, tmp_path):
         def _mark_disconnected(self):
             self.marked_connected = False
 
+        async def on_processing_start(self, event):
+            pass
+
     contents = {
         "gateway": {},
         "gateway.config": {"Platform": Platform, "PlatformConfig": PlatformConfig},
@@ -97,6 +102,8 @@ def hermes_doubles(monkeypatch, tmp_path):
         "gateway.platforms.event": {"MessageType": MessageType, "MessageEvent": MessageEvent},
         "gateway.platforms._shared": {"get_scoped_secret": lambda name, default=None: default},
         "hermes_constants": {"get_hermes_home": lambda: tmp_path / "hermes-home"},
+        "hermes_cli": {},
+        "hermes_cli.commands": {"should_bypass_active_session": lambda command: command == "stop"},
     }
     for name, attributes in contents.items():
         module = types.ModuleType(name)

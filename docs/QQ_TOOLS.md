@@ -11,6 +11,7 @@
 | `qq_send_forward` | 发送 QQ 合并转发卡片，混合自建多媒体节点与已有消息引用 |
 | `qq_get_message` | 读取一条已核验消息的文本、发送者和附件类型，不返回附件 URL |
 | `qq_get_chat_info` | 查询当前或获准目标会话的名称与类型 |
+| `qq_get_recent_messages` | 读取获准群的有界近期消息、发言人、时间、引用及历史状态；需要开启 `group_context` |
 
 这些工具只能在 NapCat 消息触发的实时 Gateway turn 中调用。CLI、TUI、其他平台会话及独立 cron 进程没有当前 QQ 身份，调用时会拒绝执行。Hermes 原有 `send_message` 和 cron 文本投递接口仍可按各自规则工作。
 
@@ -46,6 +47,18 @@ gateway:
 ```
 
 多人群聊不需要 Agent 主动发图、文件或折叠消息时，保留 `group_toolsets: []`。`qq_tools.enabled` 与 Hermes 工具集授权都必须开启，缺少任意一项时模型无法调用这些动作。
+
+实际主动参与要求 `group_toolsets: []`，因此开启群工具时必须关闭 `proactive_assist` 或保持 `dry_run: true`。自动群背景注入不依赖模型调用工具，无工具模式仍可在被叫到时使用近期历史。
+
+## 读取近期群消息
+
+`qq_get_recent_messages` 还要求 `group_context.enabled: true`。默认读取当前群；返回文字、稳定发言人 ID、时间、引用、附件类型和窗口状态，不返回媒体 URL，也不读取私人聊天历史。
+
+```json
+{"limit": 30}
+```
+
+`limit` 不得超过 `group_context.history_limit`；可传入 `before_message_id` 向前读取，但锚点必须来自当前群保留的已核验记录。分页仍受时间窗、返回量和读请求预算约束，不保证完整历史。跨群继续经过下述管理员及目标 ACL 检查。全部配置及数据保留边界见 [GROUP_CHAT](GROUP_CHAT.md)。
 
 ## 目标与权限
 

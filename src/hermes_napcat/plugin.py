@@ -88,12 +88,12 @@ async def standalone_send(pconfig, chat_id, message, *, thread_id=None,
 
 
 def register(ctx):
-    from .adapter import NapCatAdapter
-    from .tools import register_tools
+    from .group_adapter import GroupNapCatAdapter
+    from .group_tools import register_tools
 
     register_tools(ctx)
     ctx.register_platform(
-        name="napcat", label="NapCat / QQ", adapter_factory=NapCatAdapter,
+        name="napcat", label="NapCat / QQ", adapter_factory=GroupNapCatAdapter,
         check_fn=check_requirements, validate_config=validate_config,
         required_env=["NAPCAT_TOKEN"],
         install_hint="Install hermes-napcat-plugin into the Hermes Python environment with uv pip",
