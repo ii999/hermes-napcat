@@ -13,7 +13,7 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from hermes_constants import get_hermes_home
 
-from .media import MediaError, MediaStore
+from .media import MediaError, MediaStore, is_inline_source
 from .media_adapter import MediaAdapterMixin
 from .media_refs import MediaReferences
 from .plugin import settings_from_platform
@@ -57,6 +57,7 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
             return False
 
     async def disconnect(self) -> None:
+        await self._close_streams()
         await self.transport.stop()
         if self.media is not None:
             await self.media.close()
@@ -179,7 +180,8 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
             raise MediaError("outbound request exceeds ws_max_bytes; use shared media storage")
         async with self._send_gate:
             self.validate_outbound_media(target, params)
-            result = await self.transport.call(action, params)
+            result = await self.transport.call(action, params,
+                                               **self.media_transport_kwargs(params))
             if not isinstance(result, dict) or result.get("message_id") is None:
                 raise DeliveryUncertain("OneBot acknowledged a send without a message ID")
             try:
@@ -238,7 +240,8 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
             reply_to = message_id(reply_to)
         name = file_name
         if kind == "file":
-            name = name or Path(urlsplit(source).path or source).name
+            name = name or ("attachment.bin" if is_inline_source(source)
+                            else Path(urlsplit(source).path or source).name)
             if (not isinstance(name, str) or not name or "/" in name or "\\" in name
                     or len(name) > 200 or name in (".", "..")):
                 raise ValueError("invalid attachment name")
@@ -258,14 +261,16 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
         ids: list[str] = []
         if kind == "file":
             async with self._send_gate:
+                self.validate_outbound_media(target, reference)
                 upload = await self.transport.call(
                     f"upload_{target.kind}_file",
                     {**target.params, "file": reference, "name": name, "upload_file": True},
+                    **self.media_transport_kwargs(reference),
                 )
             if caption:
                 try:
                     ids.append(await self._send_parts(target, text_segments(caption, reply_to)))
-                except (OneBotError, ValueError, PermissionError) as exc:
+                except (OneBotError, MediaError, ValueError, PermissionError) as exc:
                     return {
                         "success": False,
                         "partial": True,
@@ -295,7 +300,7 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
         if kind in ("audio", "video") and caption:
             try:
                 ids.append(await self._send_parts(target, text_segments(caption)))
-            except (OneBotError, ValueError, PermissionError) as exc:
+            except (OneBotError, MediaError, ValueError, PermissionError) as exc:
                 return {
                     "success": False,
                     "partial": True,
@@ -385,7 +390,7 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
             for index, chunk in enumerate(split_text(content, self.settings.message_chars)):
                 ids.append(await self._send_parts(target, text_segments(chunk, reply_to if index == 0 else None)))
             return SendResult(success=True, message_id=ids[-1], continuation_message_ids=tuple(ids[:-1]))
-        except (OneBotError, ValueError, PermissionError) as exc:
+        except (OneBotError, MediaError, ValueError, PermissionError) as exc:
             return self._failure(exc, ids)
 
     async def _send_local_media(self, chat_id, path, kind, caption=None, reply_to=None):
@@ -422,35 +427,15 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
 
     async def send_document(self, chat_id, file_path, caption=None, file_name=None,
                             reply_to=None, metadata=None, **kwargs):
-        ids = []
         try:
-            target = Target.parse(chat_id)
-            if not self.policy.can_send(target):
-                raise PermissionError("target is not allowlisted")
-            if self.media is None:
-                raise MediaError("media store is not ready")
-            remote = await asyncio.to_thread(self.media.shared_path, file_path)
-            name = file_name or Path(file_path).name
-            if not name or "/" in name or "\\" in name or len(name) > 200:
-                raise ValueError("invalid attachment name")
-            # Validate caption before performing the irreversible file upload.
-            if caption and len(caption) > self.settings.message_chars:
-                raise ValueError("caption is too long")
-            if reply_to is not None:
-                message_id(reply_to)
-            async with self._send_gate:
-                await self.transport.call(f"upload_{target.kind}_file",
-                                          {**target.params, "file": remote, "name": name})
-            if caption:
-                result = await self.send(chat_id, caption, reply_to=reply_to)
-                if not result.success:
-                    return SendResult(success=False, error="File uploaded but caption was not delivered",
-                                      raw_response={"file_uploaded": True})
-                ids.append(result.message_id)
-            return SendResult(success=True, message_id=ids[-1] if ids else None,
-                              raw_response={"file_uploaded": True})
+            result = await self.send_agent_media(
+                Target.parse(chat_id), "file", str(file_path), caption=caption,
+                file_name=file_name, reply_to=reply_to)
+            ids = result.get("message_ids", [])
+            return SendResult(success=result["success"], message_id=ids[-1] if ids else None,
+                              error=result.get("error"), raw_response=result, retryable=False)
         except (OneBotError, MediaError, ValueError, OSError, PermissionError) as exc:
-            return self._failure(exc, ids)
+            return self._failure(exc)
 
     async def get_chat_info(self, chat_id):
         target = Target.parse(chat_id)

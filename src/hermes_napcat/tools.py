@@ -12,7 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .config import numeric_id
-from .media import MediaError
+from .media import MediaError, inline_info, is_inline_source
 from .protocol import ProtocolError, Target, message_id, segments
 from .transport import ActionError, DeliveryUncertain, NotConnected, OneBotError
 
@@ -116,6 +116,7 @@ async def _on_gateway(tool: str, args: dict[str, Any], operation, *, session_id:
         raise PermissionError("current user is not authorized to use QQ tools")
     if not adapter.settings.qq_tools.enabled:
         raise PermissionError("model-callable QQ tools are disabled for this profile")
+    _source_budget(adapter, args)
     key = _action_key(tool, session, args)
 
     async def execute():
@@ -167,8 +168,44 @@ def _bounded_text(value: Any, name: str, limit: int, *, required: bool = False) 
     return value
 
 
+def _source_budget(adapter, args: dict[str, Any]) -> None:
+    """Reject oversized inline inputs before action-key serialization or disk/network I/O."""
+    total = 0
+
+    def walk(value, depth=0):
+        nonlocal total
+        if depth > 8:
+            raise ToolRequestError("QQ arguments are too deeply nested")
+        if isinstance(value, str) and is_inline_source(value):
+            _, size, _ = inline_info(value, min(adapter.settings.media.base64_max_bytes,
+                                                 adapter.settings.media.max_bytes))
+            total += size
+            if total > adapter.settings.media.base64_batch_max_bytes:
+                raise ToolRequestError("base64 batch exceeds configured byte limit")
+        elif isinstance(value, dict):
+            for item in value.values():
+                walk(item, depth + 1)
+        elif isinstance(value, list):
+            if len(value) > 256:
+                raise ToolRequestError("QQ argument array is too large")
+            for item in value:
+                walk(item, depth + 1)
+
+    walk(args)
+
+
+def _media_source(adapter, value: Any, name: str = "source") -> str:
+    if not isinstance(value, str) or not value:
+        raise ToolRequestError(f"{name} must be a nonempty media source")
+    if is_inline_source(value):
+        inline_info(value, min(adapter.settings.media.base64_max_bytes, adapter.settings.media.max_bytes))
+        return value
+    return _bounded_text(value, name, 8192, required=True)
+
+
 def _safe_file_name(value: Any, source: str) -> str:
-    name = value if value is not None else Path(urlsplit(source).path or source).name
+    name = value if value is not None else ("attachment.bin" if is_inline_source(source)
+                                           else Path(urlsplit(source).path or source).name)
     if (not isinstance(name, str) or not name or "/" in name or "\\" in name
             or name in (".", "..") or len(name) > 200):
         raise ToolRequestError("invalid attachment name")
@@ -208,7 +245,7 @@ async def _direct_parts(adapter, args: dict[str, Any], *, target: Target | None 
             chars += len(value)
             parts.append({"type": "text", "data": {"text": value}})
         elif kind == "image":
-            source = _bounded_text(spec.get("source"), "image source", 8192, required=True)
+            source = _media_source(adapter, spec.get("source"), "image source")
             reference = await adapter.outbound_reference(
                 source, kind="image", target=target, requester_id=requester_id)
             data = {"file": reference}
@@ -271,7 +308,7 @@ async def _forward_content(
         if kind not in ("image", "audio", "video", "file"):
             raise ToolRequestError(
                 "forward segments support text, image, audio, video, file, and face")
-        source = _bounded_text(spec.get("source"), f"{kind} source", 8192, required=True)
+        source = _media_source(adapter, spec.get("source"), f"{kind} source")
         media_kind = "record" if kind == "audio" else kind
         data = {"file": await adapter.outbound_reference(
             source, kind=media_kind, target=target, requester_id=requester_id)}
@@ -282,7 +319,7 @@ async def _forward_content(
             if summary:
                 data["summary"] = summary
         if kind == "video" and spec.get("thumbnail") is not None:
-            thumb = _bounded_text(spec.get("thumbnail"), "video thumbnail", 8192, required=True)
+            thumb = _media_source(adapter, spec.get("thumbnail"), "video thumbnail")
             data["thumb"] = await adapter.outbound_reference(
                 thumb, kind="image", target=target, requester_id=requester_id)
         result.append({"type": media_kind, "data": data})
@@ -358,7 +395,7 @@ async def qq_send_media(args: dict[str, Any], **kwargs) -> dict[str, Any]:
         kind = args.get("media_type")
         if kind not in ("image", "audio", "video", "file"):
             raise ToolRequestError("media_type must be image, audio, video, or file")
-        source = _bounded_text(args.get("source"), "source", 8192, required=True)
+        source = _media_source(adapter, args.get("source"))
         reply_to = args.get("reply_to")
         if reply_to is not None:
             reply_to = message_id(reply_to)
@@ -552,7 +589,7 @@ _SEGMENT = {
     "properties": {
         "type": {"type": "string", "enum": ["text", "image", "at", "face"]},
         "text": {"type": "string"},
-        "source": {"type": "string", "description": "Allowed local path, http(s) URL, or same-chat media:<media_id> image reference."},
+        "source": {"type": "string", "description": "Absolute allowed path, http(s) URL, base64:// payload, data:<mime>;base64, payload, or same-chat media:<media_id> image. Prefer paths/references over generating base64 text."},
         "summary": {"type": "string"},
         "qq": {"type": "string", "description": "Numeric QQ ID. @all is forbidden."},
         "id": {"type": "string", "description": "Numeric QQ face ID."},
@@ -568,7 +605,7 @@ _FORWARD_SEGMENT = {
             "enum": ["text", "image", "audio", "video", "file", "face"],
         },
         "text": {"type": "string"},
-        "source": {"type": "string", "description": "Allowed local path, http(s) URL, or same-chat media:<media_id> image reference."},
+        "source": {"type": "string", "description": "Absolute allowed path, http(s) URL, base64:// payload, data:<mime>;base64, payload, or same-chat media:<media_id> image. Prefer paths/references over generating base64 text."},
         "name": {"type": "string", "description": "Display name for a file."},
         "thumbnail": {"type": "string", "description": "Optional video thumbnail source."},
         "summary": {"type": "string"},
@@ -618,7 +655,7 @@ _TOOLS = {
                     "type": "string",
                     "enum": ["image", "audio", "video", "file"],
                 },
-                "source": {"type": "string", "description": "Allowed local path, http(s) URL, or same-chat media:<media_id> image reference."},
+                "source": {"type": "string", "description": "Absolute allowed path, http(s) URL, base64:// payload, data:<mime>;base64, payload, or same-chat media:<media_id> image. Prefer paths/references over generating base64 text."},
                 "caption": {"type": "string"},
                 "file_name": {"type": "string"},
                 "thumbnail": {"type": "string", "description": "Video thumbnail source."},

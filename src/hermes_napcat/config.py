@@ -99,6 +99,20 @@ class MediaReferenceSettings(StrictModel):
     recent_limit: int = Field(default=1, ge=1, le=4)
 
 
+class StreamUploadSettings(StrictModel):
+    """NapCat-specific chunk upload; shared paths remain the first choice."""
+
+    mode: Literal["auto", "disabled", "always"] = "auto"
+    chunk_bytes: int = Field(default=256 * 1024, ge=1024, le=1024 * 1024)
+    max_bytes: int = Field(default=256 * 1024 * 1024, ge=1024, le=1024 * 1024 * 1024)
+    timeout: float = Field(default=300, gt=0, le=1800)
+    chunk_timeout: float = Field(default=30, gt=0, le=120)
+    finalize_timeout: float = Field(default=120, gt=0, le=300)
+    max_concurrent: int = Field(default=1, ge=1, le=4)
+    max_pending: int = Field(default=8, ge=1, le=32)
+    file_retention_seconds: int = Field(default=900, ge=60, le=86400)
+
+
 class MediaSettings(MediaURLPolicy):
     enabled: bool = True
     # Unset directions inherit legacy top-level policy fields, without broadening access.
@@ -106,14 +120,17 @@ class MediaSettings(MediaURLPolicy):
     outbound: MediaURLPolicy | None = None
     references: MediaReferenceSettings = Field(default_factory=MediaReferenceSettings)
     shared_cache_dir: Path | None = None
-    max_bytes: int = Field(default=10 * 1024 * 1024, ge=1024, le=256 * 1024 * 1024)
+    streaming: StreamUploadSettings = Field(default_factory=StreamUploadSettings)
+    base64_max_bytes: int = Field(default=32 * 1024 * 1024, ge=1024, le=256 * 1024 * 1024)
+    base64_batch_max_bytes: int = Field(default=64 * 1024 * 1024, ge=1024, le=512 * 1024 * 1024)
+    max_bytes: int = Field(default=32 * 1024 * 1024, ge=1024, le=256 * 1024 * 1024)
     max_attachments: int = Field(default=4, ge=1, le=16)
-    timeout: float = Field(default=30, gt=0, le=300)
+    timeout: float = Field(default=60, gt=0, le=300)
     cache_max_bytes: int = Field(default=512 * 1024 * 1024, ge=1024)
     cache_ttl_seconds: int = Field(default=86400, ge=3600)
     outbound_roots: tuple[Path, ...] = ()
     shared_paths: tuple[SharedPath, ...] = ()
-    inline_max_bytes: int = Field(default=512 * 1024, ge=1024, le=32 * 1024 * 1024)
+    inline_max_bytes: int = Field(default=10 * 1024 * 1024, ge=1024, le=32 * 1024 * 1024)
 
     def download_policy(self, direction: Literal["inbound", "outbound"]) -> MediaURLPolicy:
         if direction not in ("inbound", "outbound"):
@@ -245,7 +262,8 @@ class Settings(StrictModel):
     connect_timeout: float = Field(default=15, gt=0, le=120)
     reconnect_min: float = Field(default=1, gt=0, le=60)
     reconnect_max: float = Field(default=30, gt=0, le=300)
-    ws_max_bytes: int = Field(default=2 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
+    ws_max_bytes: int = Field(default=16 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
+    event_queue_max_bytes: int = Field(default=64 * 1024 * 1024, ge=1024, le=1024 * 1024 * 1024)
     event_queue_size: int = Field(default=128, ge=1, le=4096)
     event_workers: int = Field(default=4, ge=1, le=16)
     dedup_ttl: float = Field(default=600, ge=1, le=86400)
@@ -311,8 +329,8 @@ class Settings(StrictModel):
             raise ValueError("ws_path must be an absolute URL path")
         if self.reconnect_max < self.reconnect_min:
             raise ValueError("reconnect_max must be >= reconnect_min")
-        if 4 * ((self.media.inline_max_bytes + 2) // 3) + 16384 > self.ws_max_bytes:
-            raise ValueError("ws_max_bytes must fit base64-encoded inline_max_bytes plus overhead")
+        # Effective inline size is clamped at runtime to the configured WS budget.
+        # An existing explicit small WS limit must not break on larger new defaults.
         if not self.allow_all_users and not set(self.admins).issubset(self.allowed_users):
             raise ValueError("admins must also appear in allowed_users")
         return self

@@ -7,10 +7,11 @@ from dataclasses import replace
 from typing import Any
 from urllib.parse import urlsplit
 
-from .media import Downloaded, MediaError
+from .media import Downloaded, InlineTooLarge, MediaError, inline_info, is_inline_source
 from .media_refs import ReferencedMedia, image_file_id
 from .protocol import Incoming, Target, message_id
 from .transport import OneBotError
+from .stream_upload import StreamedMedia, StreamUploader
 
 log = logging.getLogger(__name__)
 
@@ -209,6 +210,28 @@ class MediaAdapterMixin:
             mimes.append(downloaded.mime)
         return paths, mimes, notices
 
+    async def _close_streams(self) -> None:
+        uploader = getattr(self, "_stream_uploader", None)
+        if uploader is not None:
+            await uploader.close()
+            self._stream_uploader = None
+
+    def _inline_limit(self) -> int:
+        # Preserve explicitly configured smaller WS/inline limits across upgrades.
+        limit = min(self.settings.media.inline_max_bytes,
+                    max(0, (self.settings.ws_max_bytes - 16384) // 4) * 3)
+        return 0 if self.settings.media.streaming.mode == "always" else limit
+
+    async def _media_reference(self, function, *args, **kwargs) -> str:
+        limit = self._inline_limit()
+        try:
+            return await asyncio.to_thread(function, *args, inline_limit=limit, **kwargs)
+        except InlineTooLarge as exc:
+            uploader = getattr(self, "_stream_uploader", None)
+            if uploader is None:
+                uploader = self._stream_uploader = StreamUploader(self.transport, self.settings)
+            return await uploader.upload(exc.path, exc.size)
+
     async def outbound_reference(self, source: str, *, kind: str,
                                  target: Target | None = None, requester_id: str | None = None) -> str:
         if self.media is None:
@@ -221,29 +244,58 @@ class MediaAdapterMixin:
                 raise MediaError("image references require an authenticated same-chat tool call")
             identifier = source.removeprefix("media:")
             downloaded = await self.resolve_media(identifier, target, requester_id)
-            value = await asyncio.to_thread(self.media.cached_reference, downloaded)
+            value = await self._media_reference(self.media.cached_reference, downloaded)
             self._image_access(identifier, target, requester_id)
-            return ReferencedMedia(value, identifier, requester_id)
+            reference = ReferencedMedia(value, identifier, requester_id)
+            reference.transport_reference = value
+            return reference
+        if is_inline_source(source):
+            _, size, _ = inline_info(source, min(self.settings.media.base64_max_bytes,
+                                                 self.settings.media.max_bytes))
+            if size <= self._inline_limit() and self.media.shared_root is None:
+                return await asyncio.to_thread(self.media.inline_reference, source, kind=kind)
+            downloaded = await asyncio.to_thread(self.media.import_inline, source, kind=kind)
+            return await self._media_reference(self.media.cached_reference, downloaded)
+        if len(source) > 8192:
+            raise MediaError("media path or URL is too long")
         try:
             scheme = urlsplit(source).scheme.lower()
         except ValueError as exc:
             raise MediaError("invalid media source") from exc
         if scheme in ("http", "https"):
             downloaded = await self.media.download(source, kind=kind, direction="outbound")
-            return await asyncio.to_thread(self.media.cached_reference, downloaded)
+            return await self._media_reference(self.media.cached_reference, downloaded)
         windows_drive = len(source) >= 3 and source[0].isalpha() and source[1:3] in (":/", ":\\")
         if scheme and not windows_drive:
             raise MediaError("media source must be an allowed local path, media reference or http(s) URL")
-        return await asyncio.to_thread(self.media.outbound_reference, source, kind=kind,
+        return await self._media_reference(self.media.outbound_reference, source, kind=kind,
                                        max_bytes=self.settings.qq_tools.max_local_media_bytes)
 
     def validate_outbound_media(self, target: Target, value: Any) -> None:
         """Called inside the send gate: recall/expiry while queued must stop the send."""
         if isinstance(value, ReferencedMedia):
             self._image_access(value.media_id, target, value.requester_id)
+            self.validate_outbound_media(target, getattr(value, "transport_reference", str(value)))
+        elif isinstance(value, StreamedMedia):
+            value.validate(self.transport)
         elif isinstance(value, dict):
             for item in value.values():
                 self.validate_outbound_media(target, item)
         elif isinstance(value, list):
             for item in value:
                 self.validate_outbound_media(target, item)
+
+    def media_transport_kwargs(self, value: Any) -> dict[str, int]:
+        """Pin sends of staged files to their original WS epoch, including lock wait."""
+        if isinstance(value, ReferencedMedia):
+            return self.media_transport_kwargs(getattr(value, "transport_reference", str(value)))
+        if isinstance(value, StreamedMedia):
+            return {"expected_epoch": value.epoch}
+        result: dict[str, int] = {}
+        values = value.values() if isinstance(value, dict) else value if isinstance(value, list) else ()
+        for item in values:
+            found = self.media_transport_kwargs(item)
+            if found and result and found != result:
+                raise MediaError("media uploads belong to different connections")
+            result.update(found)
+        return result

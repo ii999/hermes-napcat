@@ -9,6 +9,7 @@ provides_tools:
   - qq_send_media
   - qq_send_forward
   - qq_get_message
+  - qq_get_media
   - qq_get_chat_info
   - qq_get_recent_messages
 requires_env:

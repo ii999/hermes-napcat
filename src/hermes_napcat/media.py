@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import contextlib
 import ipaddress
 import os
@@ -76,6 +77,44 @@ class Downloaded:
     path: Path
     mime: str
     size: int
+
+
+class InlineTooLarge(MediaError):
+    """Only validated media can request a stream fallback, never an ACL/I/O error."""
+
+    def __init__(self, path: Path, size: int):
+        super().__init__("media exceeds inline upload limit; use streaming or shared storage")
+        self.path, self.size = path, size
+
+
+def is_inline_source(source: object) -> bool:
+    return isinstance(source, str) and source.startswith(("base64://", "data:"))
+
+
+def inline_info(source: str, limit: int) -> tuple[int, int, str | None]:
+    """Bound input before slicing or decoding. Return offset, decoded size and MIME."""
+    if not isinstance(source, str) or len(source) > 4 * ((limit + 2) // 3) + 128:
+        raise MediaError("base64 source exceeds configured byte limit")
+    mime = None
+    if source.startswith("base64://"):
+        offset = 9
+    elif source.startswith("data:"):
+        offset = source.find(",", 0, 128) + 1
+        header = source[5:offset - 1] if offset else ""
+        match = re.fullmatch(r"([a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+);base64", header)
+        if not match:
+            raise MediaError("data URI requires a MIME type and ;base64 encoding")
+        mime = match[1].lower()
+    else:
+        raise MediaError("inline source requires base64:// or data:<mime>;base64,")
+    count = len(source) - offset
+    if count <= 0 or count % 4:
+        raise MediaError("invalid base64 length or padding")
+    padding = 2 if source.endswith("==") else int(source.endswith("="))
+    size = count // 4 * 3 - padding
+    if size <= 0 or size > limit:
+        raise MediaError("base64 source exceeds configured byte limit or is empty")
+    return offset, size, mime
 
 
 class MediaStore:
@@ -285,7 +324,7 @@ class MediaStore:
         except MediaError:
             return None
 
-    def _reference(self, candidate: Path, size: int) -> str:
+    def _reference(self, candidate: Path, size: int, *, inline_limit: int | None = None) -> str:
         with self._storage_lock:
             mapped = self._mapped_reference(candidate)
             if mapped is not None:
@@ -324,18 +363,20 @@ class MediaStore:
                     raise
                 finally:
                     temporary.unlink(missing_ok=True)
+            limit = self.config.inline_max_bytes if inline_limit is None else min(
+                self.config.inline_max_bytes, inline_limit)
+            if size > limit:
+                raise InlineTooLarge(candidate, size)
             with candidate.open("rb") as stream:
-                value = stream.read(self.config.inline_max_bytes + 1)
-            if len(value) > self.config.inline_max_bytes:
-                raise MediaError(
-                    "media exceeds inline upload limit; configure shared_cache_dir/shared_paths "
-                    "or raise inline_max_bytes together with ws_max_bytes")
+                value = stream.read(limit + 1)
+            if len(value) > limit:
+                raise MediaError("media changed before upload")
             if len(value) != size:
                 raise MediaError("media changed before upload")
             return "base64://" + base64.b64encode(value).decode("ascii")
 
     def outbound_reference(self, path: str, *, kind: str | None = None,
-                           max_bytes: int | None = None) -> str:
+                           max_bytes: int | None = None, inline_limit: int | None = None) -> str:
         candidate = self.local_path(path)
         size = candidate.stat().st_size
         limits = [limit for limit in (max_bytes, self.config.max_bytes if kind == "image" else None)
@@ -346,7 +387,7 @@ class MediaStore:
             with candidate.open("rb") as stream:
                 if self._image_mime(stream.read(16)) is None:
                     raise MediaError("unsupported or invalid image bytes")
-        return self._reference(candidate, size)
+        return self._reference(candidate, size, inline_limit=inline_limit)
 
     def validate_cached(self, downloaded: Downloaded) -> Path:
         """Validate one explicit cache object; a cache path alone grants no access."""
@@ -358,8 +399,84 @@ class MediaStore:
             raise MediaError("downloaded media changed before upload")
         return candidate
 
-    def cached_reference(self, downloaded: Downloaded) -> str:
-        return self._reference(self.validate_cached(downloaded), downloaded.size)
+    def cached_reference(self, downloaded: Downloaded, *, inline_limit: int | None = None) -> str:
+        return self._reference(self.validate_cached(downloaded), downloaded.size,
+                               inline_limit=inline_limit)
+
+    def inline_reference(self, source: str, *, kind: str) -> str:
+        """Validate already encoded bytes blockwise, without disk or full re-encoding."""
+        if not self.config.enabled:
+            raise MediaError("media import is disabled")
+        offset, size, declared = inline_info(source, min(self.config.base64_max_bytes,
+                                                       self.config.max_bytes))
+        expected = {"image": "image/", "record": "audio/", "video": "video/"}.get(kind)
+        if (declared and expected and not declared.startswith(expected)
+                and declared != "application/octet-stream"):
+            raise MediaError("data URI MIME does not match media kind")
+        head, count = b"", 0
+        for start in range(offset, len(source), 64 * 1024):
+            encoded = source[start:start + 64 * 1024]
+            try:
+                decoded = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise MediaError("invalid base64 characters or padding") from exc
+            if (base64.b64encode(decoded).decode("ascii") != encoded
+                    or ("=" in encoded and start + len(encoded) != len(source))):
+                raise MediaError("non-canonical base64 encoding")
+            count += len(decoded)
+            head = (head + decoded[:16])[:16]
+        if count != size:
+            raise MediaError("base64 decoded size mismatch")
+        if kind == "image":
+            mime = self._image_mime(head)
+            if mime is None or declared not in (None, mime, "application/octet-stream"):
+                raise MediaError("unsupported image bytes or mismatched data URI MIME")
+        return source if source.startswith("base64://") else "base64://" + source[offset:]
+
+    def import_inline(self, source: str, *, kind: str) -> Downloaded:
+        """Strict, incremental base64 decoding into a quota-accounted private cache file."""
+        if not self.config.enabled:
+            raise MediaError("media import is disabled")
+        offset, size, declared = inline_info(source, min(self.config.base64_max_bytes,
+                                                       self.config.max_bytes))
+        expected = {"image": "image/", "record": "audio/", "video": "video/"}.get(kind)
+        if (declared and expected and not declared.startswith(expected)
+                and declared != "application/octet-stream"):
+            raise MediaError("data URI MIME does not match media kind")
+        with self._storage_lock:
+            if self._prune_and_usage() + self._reserved_bytes + size > self.config.cache_max_bytes:
+                raise MediaError("media cache quota reached")
+            temporary = self.root / f"napcat_{uuid.uuid4().hex}.bin.part"
+            mime = declared or "application/octet-stream"
+            written, head = 0, b""
+            try:
+                descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(descriptor, "wb") as output:
+                    for start in range(offset, len(source), 64 * 1024):
+                        encoded = source[start:start + 64 * 1024]
+                        try:
+                            decoded = base64.b64decode(encoded, validate=True)
+                        except (binascii.Error, ValueError) as exc:
+                            raise MediaError("invalid base64 characters or padding") from exc
+                        if (base64.b64encode(decoded).decode("ascii") != encoded
+                                or ("=" in encoded and start + len(encoded) != len(source))):
+                            raise MediaError("non-canonical base64 encoding")
+                        written += len(decoded)
+                        if written > size:
+                            raise MediaError("decoded media exceeds declared size")
+                        head = (head + decoded[:16])[:16]
+                        output.write(decoded)
+                if written != size:
+                    raise MediaError("base64 decoded size mismatch")
+                if kind == "image":
+                    mime = self._image_mime(head)
+                    if mime is None or declared not in (None, mime, "application/octet-stream"):
+                        raise MediaError("unsupported image bytes or mismatched data URI MIME")
+                destination = self.root / f"napcat_{uuid.uuid4().hex}{_EXTENSIONS.get(mime, '.bin')}"
+                os.replace(temporary, destination)
+                return Downloaded(destination, mime, size)
+            finally:
+                temporary.unlink(missing_ok=True)
 
     async def close(self) -> None:
         for attribute in ("_session", "_outbound_session"):

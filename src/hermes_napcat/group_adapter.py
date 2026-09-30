@@ -193,7 +193,8 @@ class GroupNapCatAdapter(NapCatAdapter):
         async with self._send_gate:
             self.validate_outbound_media(target, params)
             self.groups.before_send(target)  # After waiting for the send gate, before any write.
-            result = await self.transport.call(action, params)
+            result = await self.transport.call(action, params,
+                                               **self.media_transport_kwargs(params))
             if not isinstance(result, dict) or result.get("message_id") is None:
                 raise DeliveryUncertain("OneBot acknowledged a send without a message ID")
             try:
