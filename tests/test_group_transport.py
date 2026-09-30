@@ -36,4 +36,5 @@ async def test_recall_delivery_requires_opt_in_and_transport_authentication(enab
     assert len(pending) == int(enabled)
     authenticated.set()
     await transport._receive(Frames([notice]), authenticated, [])
-    assert transport._queue.qsize() == int(enabled)
+    assert transport._recalls.qsize() == int(enabled)
+    assert transport._queue.empty()

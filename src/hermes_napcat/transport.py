@@ -65,6 +65,7 @@ class OneBotTransport:
         self._runner: web.AppRunner | None = None
         self._pending: dict[str, asyncio.Future] = {}
         self._queue: asyncio.Queue = asyncio.Queue(config.event_queue_size)
+        self._recalls: asyncio.Queue = asyncio.Queue(config.event_queue_size)
         self._workers: list[asyncio.Task] = []
         self._supervisor: asyncio.Task | None = None
         self._reverse_handlers: set[asyncio.Task] = set()
@@ -95,6 +96,7 @@ class OneBotTransport:
         self._stop.clear()
         self._workers = [asyncio.create_task(self._worker(), name=f"napcat-event-{i}")
                          for i in range(self.config.event_workers)]
+        self._workers.append(asyncio.create_task(self._recall_worker(), name="napcat-recalls"))
         try:
             if self.config.mode == "forward":
                 self._session = aiohttp.ClientSession(trust_env=False)
@@ -141,9 +143,10 @@ class OneBotTransport:
         self._workers.clear()
         self._reverse_handlers.clear()
         self._supervisor = None
-        while not self._queue.empty():
-            self._queue.get_nowait()
-            self._queue.task_done()
+        for queue in (self._queue, self._recalls):
+            while not queue.empty():
+                queue.get_nowait()
+                queue.task_done()
 
     async def _forward_loop(self) -> None:
         delay = self.config.reconnect_min
@@ -265,9 +268,7 @@ class OneBotTransport:
                     future.set_result(payload)
                 else:
                     self.stats.late_responses += 1
-            elif (payload.get("post_type") == "message" or (
-                    self.config.group_context.enabled and payload.get("post_type") == "notice"
-                    and payload.get("notice_type") == "group_recall")):
+            elif payload.get("post_type") == "message" or self._accept_recall(payload):
                 if validated.is_set():
                     self._enqueue(payload)
                 elif len(preauth) < self.config.event_queue_size:
@@ -277,13 +278,40 @@ class OneBotTransport:
                     log.warning("Pre-auth event buffer full; message dropped")
         self._fail_pending()
 
+    def _accept_recall(self, event: dict) -> bool:
+        if (event.get("post_type") != "notice"
+                or str(event.get("self_id")) != self.config.self_id):
+            return False
+        kind = event.get("notice_type")
+        if kind not in ("friend_recall", "group_recall"):
+            return False
+        return ((kind == "group_recall" and self.config.group_context.enabled)
+                or (self.config.media.enabled and self.config.media.references.enabled))
+
     def _enqueue(self, event: dict) -> None:
+        # Recalls must not wait behind a same-chat download or a saturated model queue.
+        queue = self._recalls if self._accept_recall(event) else self._queue
         try:
-            self._queue.put_nowait(event)
+            queue.put_nowait(event)
             self.stats.events += 1
         except asyncio.QueueFull:
             self.stats.dropped += 1
             log.warning("OneBot event queue full; message dropped (OneBot has no durable replay)")
+
+    async def _recall_worker(self) -> None:
+        # Separate bounded admission, still outside the response reader and after account auth.
+        # Handlers can invalidate in-flight reads without taking the message's chat lock.
+        while True:
+            event = await self._recalls.get()
+            try:
+                await self.handler(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.stats.handler_errors += 1
+                log.exception("OneBot recall handler failed")
+            finally:
+                self._recalls.task_done()
 
     async def _worker(self) -> None:
         while True:
