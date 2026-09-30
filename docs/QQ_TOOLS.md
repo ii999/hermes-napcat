@@ -80,11 +80,11 @@ group:987654321
 
 ## 多媒体来源
 
-`source` 接受允许目录内的绝对本地路径、通过 `media.outbound` 策略检查的 HTTP(S) URL，以及同会话 `media:<id>` 图片引用。插件先在 Hermes 侧检查媒体，不把任意 URL 直接交给 NapCat 下载。
+`source` 接受允许目录内的绝对本地路径、通过 `media.outbound` 策略检查的 HTTP(S) URL，显式 `base64://` / `data:<mime>;base64,` 输入，以及同会话 `media:<id>` 图片引用。插件先在 Hermes 侧检查媒体，不把任意 URL 直接交给 NapCat 下载。
 
-已映射的本地文件直接用共享路径；其他已检查媒体可通过 `shared_cache_dir` 复制到专用共享暂存目录，未配置时使用受限 base64。共享映射本身不提供挂载或跨主机同步。基础文档发送仍要求共享路径。出站公网模式、10 MiB 与 WS 预算、共享暂存/配额的完整配置见 [MEDIA](MEDIA.md)。
+已映射的本地文件直接用共享路径；其他已检查媒体可通过 `shared_cache_dir` 复制到专用共享暂存目录，未配置时使用受限 base64，超限时尝试 NapCat 分块上传。共享映射本身不提供挂载或跨主机同步。基础文档发送也支持该传输选择。出站公网模式、媒体大小与 WS 预算、共享暂存/配额的完整配置见 [MEDIA](MEDIA.md)。
 
-本地图片受 `media.max_bytes` 和文件头检查约束，同时受 `qq_tools.max_local_media_bytes`（默认 256 MiB）限制；其他本地媒体沿用工具大小上限。没有共享目录时还受 `inline_max_bytes` 约束。
+本地图片受 `media.max_bytes` 和文件头检查约束，同时受 `qq_tools.max_local_media_bytes`（默认 256 MiB）限制；其他本地媒体沿用工具大小上限。没有共享目录时，超过实际 inline/WS 预算的文件使用受限分块上传；关闭 streaming 后则拒绝超限文件。
 
 启用 `media.references.enabled` 后，当前图片注释、`qq_get_message` 或群上下文可能提供 `qqimg_...`。`qq_get_media` 参数为 `{"media_id":"qqimg_实际标识"}`，返回本地 `path`、MIME、字节数和 `source`，模型必须通过可用视觉工具消费该路径才能理解像素。自动引用/近期补图则使用正常 Hermes 媒体事件，详见媒体指南。
 
@@ -192,3 +192,5 @@ qq_tools:
 ```
 
 相同 session、当前消息和参数的并发调用会共用同一个正在执行的 action，避免并行工具调度产生重复发送。操作完成后不保留幂等缓存，后续相同请求仍可再次发送。写入后超时或断线会返回 `delivery_uncertain: true`，此时应先检查 QQ 会话。
+
+base64 输入的长度、类型和整批预算，以及分块上传配置见 [STREAM_UPLOAD](STREAM_UPLOAD.md)。

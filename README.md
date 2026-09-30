@@ -24,13 +24,13 @@ QQ ↔ NapCat ↔ OneBot v11 WebSocket ↔ napcat 插件 ↔ Hermes Gateway ↔ 
 | WebSocket | 正向/反向、Bearer token、登录账号核验、心跳、重连、超时、并发 echo 关联 |
 | 消息可靠性 | 有界队列、同聊天请求顺序、跨聊天并行、限流、内存去重；发送结果不确定时不会重发 |
 | 入站媒体 | 受控 HTTP(S) 下载；图片 URL 失败可用受限文件 ID 刷新一次；可选同会话引用/近期图片补入，被动观察不下载附件 |
-| 出站媒体 | 独立 allowlist/public 策略；URL、本地和受控缓存图片统一选择共享路径/专用暂存或 base64；多图按整条 WS 请求预算拆分 |
+| 出站媒体 | 独立 allowlist/public 策略；URL、本地、base64/data URI 和受控缓存图片统一选择共享路径/专用暂存、base64 或 NapCat 分块上传；多图按整条 WS 请求预算拆分 |
 | Agent QQ 工具 | 可选 `napcat_qq` 工具集：图文/媒体发送、合并转发、消息与会话读取、`qq_get_recent_messages` 及同会话 `qq_get_media`；后者返回路径，需视觉工具消费 |
 | 权限 | 网关控制指令限 `admins`；群聊默认无模型工具；观察权限不授予执行权限；实际主动回复要求无工具群会话；发送目标也检查白名单 |
 | 主动推送 | 注册原生目标解析与 cron standalone sender；独立进程仅支持正向连接的文本推送 |
 | 运维 | 配置检查、连接探测、人工测试发送、安装脚本 |
 
-本版不包含 QQ 群管理/空间工具集、持久群历史存档、Relay、持久消息队列、跨机器大文件流式上传或语音转码。音频能否进入 Hermes STT、音视频能否在 QQ 播放，还取决于实际格式与运行环境。Agent 工具默认关闭，配置方法见 [Agent QQ 工具](docs/QQ_TOOLS.md)。开发计划见 [ROADMAP](docs/ROADMAP.md)。
+本版不包含 QQ 群管理/空间工具集、持久群历史存档、Relay、持久消息队列、跨重连上传续传或语音转码。音频能否进入 Hermes STT、音视频能否在 QQ 播放，还取决于实际格式与运行环境。Agent 工具默认关闭，配置方法见 [Agent QQ 工具](docs/QQ_TOOLS.md)。开发计划见 [ROADMAP](docs/ROADMAP.md)。
 
 ## 1. 准备环境
 
@@ -170,7 +170,7 @@ gateway:
           outbound_roots: [/srv/qq-output]
 ```
 
-工具默认绑定当前 QQ 会话。跨会话调用还需要 `allow_cross_chat: true`、当前用户属于 `admins` 且目标通过白名单。媒体来源限允许目录、经过出站安全检查的 HTTP(S) URL，或同会话 `media:<id>` 图片引用；合并转发中的已有消息也要核验来源。完整参数、折叠对话和部分成功语义见 [QQ_TOOLS](docs/QQ_TOOLS.md)，可合并的配置见 `examples/qq-tools.config.yaml`。开放群工具时，需要关闭实际主动参与或保持 dry-run。
+工具默认绑定当前 QQ 会话。跨会话调用还需要 `allow_cross_chat: true`、当前用户属于 `admins` 且目标通过白名单。媒体来源限允许目录、经过出站安全检查的 HTTP(S) URL、经字节校验的 base64/data URI，或同会话 `media:<id>` 图片引用；合并转发中的已有消息也要核验来源。完整参数、折叠对话和部分成功语义见 [QQ_TOOLS](docs/QQ_TOOLS.md)，可合并的配置见 `examples/qq-tools.config.yaml`。开放群工具时，需要关闭实际主动参与或保持 dry-run。
 
 ## 5. 分层验收
 
@@ -218,13 +218,13 @@ media:
 
 `public` 仍校验实际 DNS、逐跳重定向、非公网地址、TLS、下载大小和超时。入站策略独立，不会因开启出站公网访问而放开。私有图床只允许精确 `trusted_private_origins`，不支持放开全部内网。
 
-默认单项下载 10 MiB、单次 4 个附件；原有 inline 512 KiB 与 WS 2 MiB 默认值保持不变。10 MiB inline / 16 MiB WS 的配套示例、共享暂存配置及两端验收要求见 [媒体指南](docs/MEDIA.md) 和 `examples/media.config.yaml`。更新后重启 Gateway，配置不会热加载。
+默认单项下载/图片 32 MiB、inline 10 MiB、WS 16 MiB、下载超时 60 秒；单次 4 个入站附件保持不变。无共享卷时，超出 inline 预算的媒体自动尝试 NapCat 分块上传，默认上限 256 MiB。已有显式大小配置继续生效。完整配置、共享暂存及两端验收要求见 [媒体指南](docs/MEDIA.md) 和 `examples/media.config.yaml`。更新后重启 Gateway，配置不会热加载。
 
-URL 下载、本地图片和收到的受控图片共用共享路径/专用暂存/base64 选择。`shared_cache_dir` 位于明确的 `shared_paths` 内，只暂存已检查的媒体；不为回图开放整个入站缓存。两端必须挂载相同内容，并让 NapCat 以受控权限只读。普通图文消息按整条请求预算拆分，合并转发卡片仍保持单次动作；部分成功不会自动重试。
+URL 下载、本地图片和收到的受控图片共用共享路径/专用暂存/base64/分块上传选择。`shared_cache_dir` 位于明确的 `shared_paths` 内，只暂存已检查的媒体；不为回图开放整个入站缓存。两端必须挂载相同内容，并让 NapCat 以受控权限只读。普通图文消息按整条请求预算拆分，合并转发卡片仍保持单次动作；部分成功不会自动重试。
 
 `media.references.enabled: true` 可补入同会话引用图片；`attach_recent` 另行控制同一发言人的近期图片。群里先发图再 @ 还需要启用群上下文观察。普通观察只留短期引用，不下载整个群的图片；主动参与不自动读图。工具读取/原样回图继续受 `qq_tools` 和工具集授权约束，跨会话图片引用始终拒绝。
 
-收到的本地路径、`file://` 或 `get_image` 返回的 NapCat 路径不会被当作 Hermes 本地文件打开。缺少有效 URL/文件标识、图片过期或格式不支持时会说明未读取；插件不提供音视频转码、跨主机流式传输或独立 cron 媒体发送。
+收到的本地路径、`file://` 或 `get_image` 返回的 NapCat 路径不会被当作 Hermes 本地文件打开。缺少有效 URL/文件标识、图片过期或格式不支持时会说明未读取；插件不提供音视频转码、跨重连断点续传或独立 cron 媒体发送。分块上传、base64 直发、旧配置迁移与失败语义见 [STREAM_UPLOAD](docs/STREAM_UPLOAD.md)。
 
 ## 开发与故障排查
 

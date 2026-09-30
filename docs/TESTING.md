@@ -2,6 +2,12 @@
 
 日期：2026-09-18；版本：0.2.0。运行环境为本次交付容器，不是用户的 QQ 服务器。
 
+## 流式上传与 base64 扩展回归（2026-09-30）
+
+本轮基于 PR #3 的 `fce774b`，在 Linux/Python 3.13.5 使用 `uv run --no-project --offline pytest -q` 复现原有 171 项通过，再运行扩展测试得到 **218 passed**。`uv build --offline --no-build-isolation` 成功生成源码包和 wheel。本地没有 Ruff；本轮代码提交 `4aa43e6` 已通过 Python 3.12/3.13 GitHub Actions 的 `uv sync --group dev`、pytest、Ruff 和构建，见 [CI #27](https://github.com/ii999/hermes-napcat/actions/runs/36708938990)。后续提交以 PR 最新 checks 为准。
+
+新增 47 项参数化回归覆盖标准 base64/data URI、旧 8192 字符限制修正、规范编码/MIME/大小/总批次预算、直接与缓存传输、四种媒体分块发送、逐块与完整性回执、错误路径/哈希/大小、失败/取消/关闭、不重复发 QQ、连接 epoch/保留期、旧 WS 限制动态分块、正反向真实 loopback WebSocket、消息队列总字节预算和撤回独立通道。上游接口源码基准与实机边界见 [STREAM_UPLOAD](STREAM_UPLOAD.md)。未执行真实 QQ 或完整 Hermes Gateway 联调。
+
 ## 媒体扩展回归（2026-09-30）
 
 基线 `741820f` 的本地测试为 126 项。新增分方向策略、共享暂存、链接刷新、受控引用及 WS 拆分后，在 Linux/Python 3.13.5 本地执行 `uv run --no-project --offline pytest -q`，**171 passed**。本机复用已安装的测试依赖；该离线命令不等同于锁文件重建环境。`uv build --offline --no-build-isolation` 成功生成 sdist 和 wheel，并包含新增媒体模块。
