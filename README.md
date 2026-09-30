@@ -1,90 +1,88 @@
 # Hermes NapCat Plugin
 
-通过 OneBot v11 双向 WebSocket，把 NapCat QQ 接入 Hermes Gateway。项目使用 Python 3.12+、`uv` 和 `/src` 布局，以独立 Python 包与目录插件入口分发，不修改 Hermes 源码。
-
-当前包版本：**0.2.0，待真实 QQ 联调**。可选群聊上下文、参与策略及受控图片引用默认关闭；媒体入站/出站策略可独立配置。我们核验了 Hermes `v2026.9.14`（0.21.3）的源码接口；完整 Hermes Gateway、模型调用、QQ 登录和媒体编码仍需要在部署环境验收。详见 [测试记录](docs/TESTING.md) 与 [群聊功能和验收说明](docs/GROUP_CHAT.md)。
+把 QQ 私聊和群聊接入 Hermes Agent。插件通过 NapCat 的 OneBot v11 WebSocket 收发消息，由 Hermes Gateway 管理 Agent 调用和会话。
 
 ```text
-QQ ↔ NapCat ↔ OneBot v11 WebSocket ↔ napcat 插件 ↔ Hermes Gateway ↔ Agent
+QQ ↔ NapCat ↔ OneBot v11 WebSocket ↔ Hermes NapCat Plugin ↔ Hermes Gateway ↔ Agent
 ```
 
-默认由插件连接 NapCat WebSocket Server。反向模式由 NapCat 连接插件的 `/onebot/v11`。消息事件、API 请求及 `echo` 响应共用一条连接，插件不依赖 NapCat HTTP API。
+支持文本、图片、语音、视频、文件和合并转发，并可按需启用群聊背景、主动参与及 QQ 工具。插件以独立 Python 包和 Hermes 目录插件安装，不修改 Hermes 核心代码，也不依赖 NapCat HTTP API。
 
-## 能力与边界
+**当前版本：0.2.0。真实 QQ 与完整 Hermes Gateway 联调尚待验收。** 本地测试使用模拟 Hermes/OneBot 接口及 loopback HTTP/WebSocket 服务；Hermes 接口已按 `v2026.9.14`（0.21.3）做源码核验。音视频播放、视觉模型、STT/TTS 和实际部署兼容性需要在目标环境验证。详见 [测试记录](docs/TESTING.md) 和 [上游兼容性](docs/COMPATIBILITY.md)。
 
-| 能力 | 实现与边界 |
+## 功能概览
+
+| 能力 | 支持范围 |
 | --- | --- |
-| 私聊、群聊 | 用户白名单；群聊还必须满足群白名单；自己发送的消息不触发 Agent |
-| 群触发 | `@机器人`、经过服务端校验的回复、带词边界的 `/ai` 前缀 |
-| 群聊上下文 | 可选实时观察、按需有界历史回填、发言人/时间/@/引用归属；`channel_context` 注入，保留按用户划分的会话 |
-| 主动参与 | 可选静默窗口、连发片段合并、规则或无工具分类器；默认关闭，启用后默认 dry-run，具有冷却/预算和发送前过期检查 |
-| 撤回 | 群上下文及短期图片引用处理所属账号的撤回通知；停止后续读取/发送，不能收回已交给模型的数据或补齐丢失的通知 |
-| Hermes 接入 | 原生 `BasePlatformAdapter`，`SessionSource`、账号上下文、媒体事件；会话由 Gateway 管理 |
-| 文本回复 | 结构化消息段、引用、分段发送；不会把模型输出的 CQ 字符串解释为控制指令 |
-| WebSocket | 正向/反向、Bearer token、登录账号核验、心跳、重连、超时、并发 echo 关联 |
-| 消息可靠性 | 有界队列、同聊天请求顺序、跨聊天并行、限流、内存去重；发送结果不确定时不会重发 |
-| 入站媒体 | 受控 HTTP(S) 下载；图片 URL 失败可用受限文件 ID 刷新一次；可选同会话引用/近期图片补入，被动观察不下载附件 |
-| 出站媒体 | 独立 allowlist/public 策略；URL、本地、base64/data URI 和受控缓存图片统一选择共享路径/专用暂存、base64 或 NapCat 分块上传；多图按整条 WS 请求预算拆分 |
-| Agent QQ 工具 | 可选 `napcat_qq` 工具集：图文/媒体发送、合并转发、消息与会话读取、`qq_get_recent_messages` 及同会话 `qq_get_media`；后者返回路径，需视觉工具消费 |
-| 权限 | 网关控制指令限 `admins`；群聊默认无模型工具；观察权限不授予执行权限；实际主动回复要求无工具群会话；发送目标也检查白名单 |
-| 主动推送 | 注册原生目标解析与 cron standalone sender；独立进程仅支持正向连接的文本推送 |
-| 运维 | 配置检查、连接探测、人工测试发送、安装脚本 |
+| 私聊与群聊 | 用户白名单；群聊同时检查群白名单，支持 @机器人、回复机器人和 `/ai` 前缀触发 |
+| 文本收发 | 引用、长文本分段、结构化消息段；模型输出的 CQ 字符串按普通文本发送 |
+| 图片与其他媒体 | 受控 URL 下载、本地文件、base64/data URI、共享目录及 NapCat 分块上传；不提供音视频转码 |
+| 图片引用 | 可选同会话引用图、同一发言人的近期图片补入，以及通过工具读取或原样回图 |
+| 群聊背景 | 可选实时观察、有界历史回填，保留发言人、时间、@和引用信息；会话仍由 Hermes 管理 |
+| 主动参与 | 可选规则或无工具分类器判断；默认关闭，启用后默认 dry-run，受冷却、预算和回复时效限制 |
+| Agent QQ 工具 | 可选 `napcat_qq` 工具集，支持图文/媒体发送、合并转发、消息/会话读取和近期群消息查询 |
+| 连接与可靠性 | 正向/反向 WebSocket、token 与登录账号核验、心跳、重连、并发请求关联、有界队列、限流和内存去重 |
+| 定时投递 | Hermes 原生目标解析与 cron sender；独立进程仅支持正向连接的文本投递 |
+| 运维 | 配置检查、连接探测、人工测试发送、安装与 Hermes 接口检查脚本 |
 
-本版不包含 QQ 群管理/空间工具集、持久群历史存档、Relay、持久消息队列、跨重连上传续传或语音转码。音频能否进入 Hermes STT、音视频能否在 QQ 播放，还取决于实际格式与运行环境。Agent 工具默认关闭，配置方法见 [Agent QQ 工具](docs/QQ_TOOLS.md)。开发计划见 [ROADMAP](docs/ROADMAP.md)。
+群聊背景、主动参与、图片引用和 Agent QQ 工具均需显式启用。群工具集默认为空；普通观察不下载附件，也不授予被观察者调用 Agent 的权限。
 
-## 1. 准备环境
+当前不包含群管理、QQ 空间、持久群历史、Relay、持久消息队列或跨重连上传续传。发送结果不确定时不会自动重发；内存去重也不提供跨进程重启的投递保证。
 
-使用已安装且能启动的 Hermes，以及已登录专用测试 QQ 账号的 NapCat。先保留 Hermes 的模型配置和权限配置备份。不要把未知群成员直接接到具有宿主机终端、文件写入或浏览器权限的 Agent。
+## 快速接入
 
-解压源码后，在 `hermes-napcat` 项目目录中执行：
+以下步骤使用同机正向连接：插件连接 NapCat 的 WebSocket Server。需要已经能运行的 Hermes、已登录 QQ 的 NapCat，以及 Python 3.12+ 和 `uv`。本仓库不安装 Hermes、NapCat 或 QQ 客户端。
+
+所有仓库命令均在 `hermes-napcat` 项目目录执行。示例中的 QQ 号、密钥和安装路径需要替换为实际值。
+
+### 1. 安装项目依赖
 
 ```sh
 uv sync --group dev
-uv run pytest -q
 ```
 
-仓库附带 `uv.lock` 以固定 Python 依赖解析结果。项目不自动下载 Hermes、QQ 客户端或 NapCat。
+依赖由 [pyproject.toml](pyproject.toml) 声明，仓库提供 `uv.lock`。
 
-发行包另附 `requirements-tested.txt`，记录此前本地验收的依赖版本。该文件用于复现实验环境，不代替完整跨平台锁文件；本分支的 CI 结果以 GitHub Actions 为准。
-
-## 2. 配置 NapCat
+### 2. 配置 NapCat OneBot
 
 在 NapCat 的 OneBot 网络配置中启用 **WebSocket Server**：
 
-```text
-host:              127.0.0.1
-port:              3001
-messagePostFormat: array
-reportSelfMessage: false
-enableForcePushEvent: true
-token:             你生成的随机密钥
-```
+| 设置 | 值 |
+| --- | --- |
+| `host` | `127.0.0.1` |
+| `port` | `3001` |
+| `messagePostFormat` | `array` |
+| `reportSelfMessage` | `false` |
+| `enableForcePushEvent` | `true` |
+| `token` | 自行生成的随机密钥 |
 
-可参考 `examples/napcat-onebot-forward.json`。示例是需要合并的网络配置片段，不要覆盖原有完整 NapCat 配置。这里使用的是 **OneBot token**，与 NapCat WebUI 登录 token 无关。
+完整片段见 [正向连接示例](examples/napcat-onebot-forward.json)，合并所需网络配置即可。这里的 token 是 **OneBot 访问密钥**，与 NapCat WebUI 登录 token 不同。
 
-生成密钥后，将同一个值填写到 NapCat OneBot 配置和 Hermes 所用 profile 的 `.env`：
+可以用以下命令生成密钥：
 
 ```sh
 uv run --no-project python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
-Hermes `.env` 示例：
+### 3. 配置 Hermes profile 环境变量
+
+将以下内容写入运行 Gateway 的 Hermes profile `.env`，其中 `NAPCAT_TOKEN` 与 NapCat 中填写的值相同：
 
 ```dotenv
-NAPCAT_TOKEN=替换为上一步生成的密钥
+NAPCAT_TOKEN=替换为生成的随机密钥
 NAPCAT_SELF_ID=机器人登录的QQ号
 NAPCAT_ALLOWED_USERS=你的QQ号,另一个获准QQ号
 NAPCAT_ALLOW_ALL_USERS=false
 NAPCAT_HOME_CHANNEL=private:你的QQ号
 ```
 
-`NAPCAT_ALLOWED_USERS` 同时供插件和 Hermes 网关鉴权读取。**部署时必须配置这项环境变量**；不要只在插件 YAML 中写 `allowed_users`，否则可能通过插件检查后被网关拒绝。空列表拒绝用户，`admins` 必须属于该列表。`NAPCAT_ALLOW_ALL_USERS=true` 会允许所有用户私聊调用，生产部署应保留 `false`。
+`NAPCAT_ALLOWED_USERS` 同时供插件和 Hermes Gateway 鉴权读取，部署时必须设置；只在插件 YAML 中写 `allowed_users` 可能仍被 Gateway 拒绝。空白名单默认拒绝用户。`NAPCAT_HOME_CHANNEL` 是可选的默认投递目标。
 
-令牌和 QQ 号不要提交到 GitHub。命令行诊断不会自动读取 Hermes 的 `.env`，运行诊断前请在当前进程环境中设置上述变量。Hermes 运行时由它自己的 profile secret scope 提供变量。
+环境变量参考 [examples/.env.example](examples/.env.example)。密钥保存在操作者的 profile 环境中，不要提交到仓库。多个 QQ 账号使用独立的 Hermes profile、配置和缓存目录。
 
-## 3. 安装到 Hermes
+### 4. 安装插件到 Hermes
 
-指定 **Hermes 实际使用的 Python 解释器**。`--hermes-python` 不应指向一个与 Hermes 无关的新虚拟环境。下面路径只是示例，须换成你的安装路径；Windows 使用对应虚拟环境中的 `Scripts/python.exe`。
+指定 **实际运行 Hermes 的 Python 解释器** 和 **Gateway 使用的 profile 目录**：
 
 ```sh
 uv run --no-project python scripts/install_plugin.py \
@@ -92,23 +90,13 @@ uv run --no-project python scripts/install_plugin.py \
   --hermes-home /srv/hermes-home
 ```
 
-从旧版升级时增加 `--upgrade`。安装脚本会同时更新 `plugin.yaml`、目录入口和延迟加载的 `tools.py`；只替换 wheel 会留下旧入口，Hermes 无法发现新工具。
+Windows 的解释器路径通常以 `Scripts/python.exe` 结尾。`--hermes-home` 必须与 Gateway 使用的 `HERMES_HOME` 或 profile 目录一致。
 
-安装脚本通过 `uv pip` 安装包，随后用该解释器运行真实 Hermes 接口检查，再将 `plugin/` 安装到 `<hermes-home>/plugins/napcat/`。它不会改写 Hermes 核心代码或现有配置文件。安装失败会返回非零退出码。已有同名目录时需要检查后使用 `--upgrade`；脚本会把旧入口备份到 `<hermes-home>/plugin-backups/`。
+安装脚本会依次安装 Python 包、使用该解释器检查真实 Hermes 接口，然后将目录入口安装到 `<hermes-home>/plugins/napcat/`。它不会改写现有 Hermes 配置。升级时追加 `--upgrade`，旧入口会备份到 `<hermes-home>/plugin-backups/`。升级需要同时更新 Python 包和目录入口，仅替换 wheel 不足以更新工具发现信息。
 
-`--hermes-home` 必须与启动 Gateway 时使用的 `HERMES_HOME`/profile 目录一致。目录里存放的是导入入口，Python 包必须存在于运行 Gateway 的同一个环境中。多账号请使用各自独立的 Hermes profile、配置和缓存目录。
+### 5. 启用平台
 
-独立运行接口检查：
-
-```sh
-/opt/hermes-agent/.venv/bin/python scripts/check_hermes_contract.py
-```
-
-这个检查会导入实际 Hermes 类、验证抽象接口和注册参数；不会启动模型或连接 QQ。如果失败，请先处理版本/环境不匹配，不要绕过检查直接上线。
-
-## 4. 合并 Hermes 配置
-
-将 `examples/hermes.config.yaml` 中的相关键合并到现有 `config.yaml`，保留原有模型和其他平台配置。核心示例：
+将下面的键合并到该 profile 的 `config.yaml`，保留已有模型、提供商和其他平台配置：
 
 ```yaml
 group_sessions_per_user: true
@@ -121,7 +109,6 @@ gateway:
     napcat:
       enabled: true
       extra:
-        self_id: '机器人QQ号'
         mode: forward
         ws_url: ws://127.0.0.1:3001
         allowed_groups: ['获准群号']
@@ -130,51 +117,25 @@ gateway:
         group_reply_to_bot: true
         group_prefixes: ['/ai']
         group_toolsets: []
-        media:
-          outbound_roots: []
-          shared_paths: []
 platform_toolsets:
   napcat: []
 ```
 
-先用无工具聊天验证收发。群聊默认用 `group_toolsets: []` 覆盖平台工具集；私聊由 `platform_toolsets.napcat` 决定。之后按你的 Hermes 实际工具集名称配置权限，不要照搬未经核验的工具集名称。
+`admins` 中的用户必须同时出现在 `NAPCAT_ALLOWED_USERS`。只用私聊时可将 `allowed_groups` 设为 `[]`。完整示例见 [Hermes 配置](examples/hermes.config.yaml)。
 
-`admins` 允许网关控制命令和控制提示响应；不代表绕过 Hermes 自身权限。项目关闭平台 `/update` 能力。`group_sessions_per_user: true` 用于按群成员划分会话；更改为共享会话前要确认群成员愿意共享上下文。插件不会建立第二套会话数据库。
+先保持工具集为空，确认基础收发。私聊工具由 `platform_toolsets.napcat` 控制，群聊用 `group_toolsets` 单独限制。`group_sessions_per_user: true` 按群成员划分会话；改为共享会话前应确认群成员接受共享上下文。
 
-启动方式沿用你的 Hermes 部署，可以在专用工作目录下运行 `hermes gateway run`，也可以重启已经配置的 gateway 服务。
+### 6. 启动并验证
 
-### 可选：群聊背景与主动参与
+沿用现有 Hermes 服务启动方式，或在专用工作目录运行：
 
-合并 `examples/group-chat.config.yaml`。`group_context.enabled: true` 开启在线观察和被点名时的历史背景；`observe_all_members: true` 需要管理员明确授权及群成员知晓数据用途，不授予其他群友 Agent 权限。`proactive_assist` 默认关闭，示例开启的是只判断不发言的 dry-run。实际主动回复需要 `dry_run: false` 且 `group_toolsets: []`。
-
-完整配置、可选轻量分类器、近期消息读取工具、隐私边界和实机验收方法见 [GROUP_CHAT](docs/GROUP_CHAT.md)。普通观察不下载附件；历史窗口不等于完整群档案，也不能保证补齐断线期间的全部消息。
-
-### 可选：Agent 主动操作 QQ
-
-完成基础收发验收后，可以按需开放 `napcat_qq`：
-
-```yaml
-platform_toolsets:
-  napcat: [napcat_qq]
-
-gateway:
-  platforms:
-    napcat:
-      extra:
-        # 多人群若不需要主动发送能力，继续保留 []。
-        group_toolsets: [napcat_qq]
-        qq_tools:
-          enabled: true
-          allow_cross_chat: false
-        media:
-          outbound_roots: [/srv/qq-output]
+```sh
+hermes gateway run
 ```
 
-工具默认绑定当前 QQ 会话。跨会话调用还需要 `allow_cross_chat: true`、当前用户属于 `admins` 且目标通过白名单。媒体来源限允许目录、经过出站安全检查的 HTTP(S) URL、经字节校验的 base64/data URI，或同会话 `media:<id>` 图片引用；合并转发中的已有消息也要核验来源。完整参数、折叠对话和部分成功语义见 [QQ_TOOLS](docs/QQ_TOOLS.md)，可合并的配置见 `examples/qq-tools.config.yaml`。开放群工具时，需要关闭实际主动参与或保持 dry-run。
+从白名单 QQ 私聊机器人，再在白名单群中尝试 `@机器人 你好`、`/ai 你好`，以及回复机器人消息。群触发还会校验 @/回复归属和前缀边界，机器人自己的消息不会触发 Agent。随后验证未授权用户和群无法调用。
 
-## 5. 分层验收
-
-`examples/napcat.yaml` 是独立诊断使用的 **扁平配置**，内容对应 `gateway.platforms.napcat.extra`。修改其中的机器人号、管理员及群号，使其与实际环境一致。不要把完整 Hermes YAML 传给诊断 CLI。
+需要单独诊断连接时，先修改 [examples/napcat.yaml](examples/napcat.yaml) 中的账号、群和管理员配置，并在当前终端进程环境中设置 `NAPCAT_TOKEN`、`NAPCAT_SELF_ID`、`NAPCAT_ALLOWED_USERS` 等变量。**诊断 CLI 不会自动读取 Hermes 的 `.env`。** 它接受对应 `gateway.platforms.napcat.extra` 的扁平 YAML，不接受完整 Hermes 配置。
 
 ```sh
 uv run hermes-napcat --config examples/napcat.yaml check
@@ -183,15 +144,55 @@ uv run hermes-napcat --config examples/napcat.yaml send \
   --target private:你的QQ号 --message 'NapCat transport test'
 ```
 
-`check` 不访问网络；`probe` 核验已登录账号并读取 OneBot 状态；`send` 会向指定白名单目标发送一条真实消息。`probe` 能证明传输可用，不能证明 Hermes Gateway 已加载插件。
+- `check`：只校验配置，不访问网络。
+- `probe`：连接 OneBot，核验登录账号并读取状态；不证明 Gateway 已加载插件。
+- `send`：向指定白名单目标发送一条真实 QQ 消息。
 
-Gateway 启动后，先从白名单 QQ 私聊机器人，再在白名单群中发送 `@机器人 你好`、`/ai 你好` 和回复机器人消息。随后用未授权用户/群验证拒绝行为。测试真实 LLM、会话隔离和媒体的方法见 [TESTING](docs/TESTING.md)。
+目标格式为 `private:QQ号` 或 `group:群号`，不接受裸数字。Hermes cron 投递平台填写 `napcat`，目标和 `NAPCAT_HOME_CHANNEL` 使用同一格式。
 
-聊天目标使用 `private:123456789` 或 `group:987654321`，不接受没有类型前缀的数字。配置默认推送目标时，`NAPCAT_HOME_CHANNEL` 使用同一种写法。cron 的投递平台填写 `napcat`，由 Hermes 的目标解析与独立发送钩子完成路由。
+## 按需启用
 
-## 6. 反向连接与容器网络
+### 群聊背景与主动参与
 
-反向模式示例：
+合并 [群聊配置示例](examples/group-chat.config.yaml)，用 `group_context.enabled: true` 开启背景观察和按需历史回填。默认观察范围受用户白名单限制；`observe_all_members: true` 需要管理员明确授权，并让群成员知晓数据用途。
+
+`proactive_assist` 默认关闭。启用后先保留 `dry_run: true`，只判断是否应参与；实际发言需要 `dry_run: false` 且 `group_toolsets: []`。历史回填有数量和时间边界，不保证补齐断线期间全部消息。配置、分类器和验收步骤见 [群聊指南](docs/GROUP_CHAT.md)。
+
+### Agent QQ 工具
+
+在需要的会话工具集中加入 `napcat_qq`，同时设置 `qq_tools.enabled: true`。工具默认绑定当前 QQ 会话。跨会话调用还要求 `allow_cross_chat: true`、当前用户属于 `admins`，并且目标通过白名单检查。
+
+工具可以发送图文、媒体和合并转发，读取消息、会话及近期群消息。`qq_get_media` 返回受控图片缓存路径，需要会话已有的视觉读取工具消费；工具返回的 JSON 不会自动成为模型视觉输入。参数和配置见 [QQ 工具指南](docs/QQ_TOOLS.md) 与 [配置示例](examples/qq-tools.config.yaml)。
+
+### 媒体与图片引用
+
+入站和出站下载策略独立，默认使用 QQ 域名白名单。需要发送公网图床内容时，在 `gateway.platforms.napcat.extra` 下设置：
+
+```yaml
+media:
+  outbound:
+    mode: public
+```
+
+`public` 仍检查 DNS、重定向、非公网地址、TLS、大小和超时。私有图床需要精确配置 `trusted_private_origins`；本地发送目录由 `outbound_roots` 授权。完整策略及共享卷配置见 [媒体指南](docs/MEDIA.md) 和 [配置示例](examples/media.config.yaml)。
+
+| 限制 | 默认值 |
+| --- | --- |
+| 单项下载 / 本地图片 | 32 MiB |
+| inline 原始媒体 | 10 MiB，另受实际 WebSocket 预算限制 |
+| 单条 WebSocket 消息 | 16 MiB，含 base64 和 JSON 开销 |
+| 分块上传 | 256 MiB，仍受具体媒体来源的大小限制 |
+| 每轮入站附件 | 4 个 |
+
+已有配置中的显式限制继续生效；例如诊断示例保留了 10 MiB 的下载上限。传输优先使用共享路径或专用共享暂存，再选择 base64；超过 inline 预算时默认尝试 NapCat 分块上传。共享路径要求两端实际挂载同一份存储，并让 NapCat 有受控读取权限。NapCat、代理和 QQ 的实际限制还需单独验证。分块参数、base64 格式与失败处理见 [上传指南](docs/STREAM_UPLOAD.md)。
+
+设置 `media.references.enabled: true` 可启用同会话引用图补入；`attach_recent` 另行控制同一发言人的近期图片。群里“先发图再 @”还需要群上下文观察。普通观察只记录短期引用，不下载全群附件；主动参与不会自动读图。引用过期或收到撤回通知后停止后续读取/发送，已交给模型的数据无法收回，断线期间丢失的撤回通知也无法可靠补齐。
+
+配置修改后需重启 Gateway。
+
+## 反向连接与容器部署
+
+反向模式由 NapCat WebSocket Client 连接插件。在 `gateway.platforms.napcat.extra` 中配置：
 
 ```yaml
 mode: reverse
@@ -200,33 +201,34 @@ listen_port: 3002
 ws_path: /onebot/v11
 ```
 
-在 NapCat 启用 WebSocket Client，URL 设置为 `ws://127.0.0.1:3002/onebot/v11`，配置相同 token。可合并 `examples/napcat-onebot-reverse.json`。插件接受 Universal 双向连接，验证 `Authorization: Bearer ...`、账号和已连接客户端数量。
+NapCat 连接地址设为 `ws://127.0.0.1:3002/onebot/v11`，使用同一个 OneBot token，参考 [反向连接示例](examples/napcat-onebot-reverse.json)。插件接受一条 Universal 双向连接，并校验 Bearer token、账号与客户端角色。监听启动后，需要 NapCat 实际连入才能发送。
 
-同一台物理机上的两个容器有各自的 loopback。NapCat 和 Hermes 位于不同容器时，连接地址应使用专用容器网络内的服务名，同时调整服务监听地址。显式设置 `allow_insecure_ws: true` 才允许非 loopback 明文连接；不要把 OneBot 端口公开到公网。跨主机建议通过受控隧道或校验证书的 WSS，反向监听需要由反向代理终止 TLS。代理须保留 Authorization/X-Self-ID/X-Client-Role，并关闭敏感头日志。
+两个容器不共享 loopback 地址。跨容器使用专用网络中的服务名并调整监听地址；非 loopback 明文 WebSocket 需要显式设置 `allow_insecure_ws: true`。跨主机使用受控隧道或校验证书的 WSS，反向监听的 TLS 由反向代理终止。代理应保留 `Authorization`、`X-Self-ID`、`X-Client-Role`，避免记录敏感请求头。不要公开 OneBot 端口。
 
-反向模式 `connect()` 成功表示监听器启动，NapCat 尚未连入时仍无法发送。该模式的独立 cron 发送返回错误；使用正在运行的 Gateway 投递，或改用正向模式。不要同时用诊断程序和 Gateway 抢占同一个反向监听端口。
+反向模式不支持独立 cron sender，应通过运行中的 Gateway 投递。诊断程序与 Gateway 不能同时占用同一个反向监听端口。
 
-## 7. 媒体和共享目录
+## 权限与故障排查
 
-HTTP 与 HTTPS 均支持。旧配置保持默认 QQ 域名白名单；出站访问任意公网图床可显式配置：
+网关控制命令仅限 `admins`，仍受 Hermes 自身权限约束；平台 `/update` 已禁用。发送目标同样检查白名单。插件不会向模型开放任意 OneBot action，也不会将入站消息或 `get_image` 返回的本地路径当作 Hermes 文件读取。完整边界见 [SECURITY.md](SECURITY.md)。
 
-```yaml
-media:
-  outbound:
-    mode: public
+| 现象 | 检查项 |
+| --- | --- |
+| `probe` 成功，但 Agent 不回复 | 插件是否加载、Hermes Python 与 profile 是否正确、`NAPCAT_ALLOWED_USERS` 是否对 Gateway 可见 |
+| 私聊正常，群聊不触发 | 用户与群白名单、@目标、回复来源以及 `/ai` 的前缀边界 |
+| 升级后找不到 QQ 工具 | 用安装脚本加 `--upgrade` 同时更新包与目录入口，确认工具开关和会话工具集，重启 Gateway |
+| 图片或文件被拒绝 | 下载策略、大小限制、允许的本地目录、共享挂载权限及 NapCat 分块接口支持情况 |
+| 返回 `partial` 或 `delivery_uncertain` | 先检查 QQ 中已收到的内容及返回的消息 ID，避免重试导致重复发送 |
+| Hermes 升级后接入失败 | 在真实 Hermes 环境重跑接口检查，再按测试文档执行收发和工具验收 |
+
+可独立运行接口检查；它会导入 Hermes 并核对接口，不启动模型或连接 QQ：
+
+```sh
+/opt/hermes-agent/.venv/bin/python scripts/check_hermes_contract.py
 ```
 
-`public` 仍校验实际 DNS、逐跳重定向、非公网地址、TLS、下载大小和超时。入站策略独立，不会因开启出站公网访问而放开。私有图床只允许精确 `trusted_private_origins`，不支持放开全部内网。
+## 开发与文档
 
-默认单项下载/图片 32 MiB、inline 10 MiB、WS 16 MiB、下载超时 60 秒；单次 4 个入站附件保持不变。无共享卷时，超出 inline 预算的媒体自动尝试 NapCat 分块上传，默认上限 256 MiB。已有显式大小配置继续生效。完整配置、共享暂存及两端验收要求见 [媒体指南](docs/MEDIA.md) 和 `examples/media.config.yaml`。更新后重启 Gateway，配置不会热加载。
-
-URL 下载、本地图片和收到的受控图片共用共享路径/专用暂存/base64/分块上传选择。`shared_cache_dir` 位于明确的 `shared_paths` 内，只暂存已检查的媒体；不为回图开放整个入站缓存。两端必须挂载相同内容，并让 NapCat 以受控权限只读。普通图文消息按整条请求预算拆分，合并转发卡片仍保持单次动作；部分成功不会自动重试。
-
-`media.references.enabled: true` 可补入同会话引用图片；`attach_recent` 另行控制同一发言人的近期图片。群里先发图再 @ 还需要启用群上下文观察。普通观察只留短期引用，不下载整个群的图片；主动参与不自动读图。工具读取/原样回图继续受 `qq_tools` 和工具集授权约束，跨会话图片引用始终拒绝。
-
-收到的本地路径、`file://` 或 `get_image` 返回的 NapCat 路径不会被当作 Hermes 本地文件打开。缺少有效 URL/文件标识、图片过期或格式不支持时会说明未读取；插件不提供音视频转码、跨重连断点续传或独立 cron 媒体发送。分块上传、base64 直发、旧配置迁移与失败语义见 [STREAM_UPLOAD](docs/STREAM_UPLOAD.md)。
-
-## 开发与故障排查
+项目使用 Python 3.12+、`src/` 布局和 `uv`。协议、传输模块独立于 Hermes，Hermes 依赖位于 Gateway 接入边界。
 
 ```sh
 uv run pytest -q
@@ -234,6 +236,15 @@ uv run ruff check .
 uv build
 ```
 
-常见问题：能探测但 Agent 无回复时检查插件是否加载、profile 目录是否一致以及 `NAPCAT_ALLOWED_USERS`；收群消息但不触发时检查用户与群白名单、@目标和前缀边界；发送结果为 `delivery_uncertain` 时先检查 QQ 会话，避免手工重试重复发出；附件拒绝时检查域名、字节上限与共享挂载。日志不会主动输出原始消息或令牌，但部署者仍需限制日志访问并对上游错误做脱敏。
+| 文档 | 内容 |
+| --- | --- |
+| [架构](docs/ARCHITECTURE.md) | 模块职责与消息链路 |
+| [群聊](docs/GROUP_CHAT.md) | 背景观察、历史回填、主动参与和隐私边界 |
+| [媒体](docs/MEDIA.md) | 下载策略、共享目录、图片引用和撤回 |
+| [流式上传](docs/STREAM_UPLOAD.md) | 分块上传、base64 输入、资源限制与失败语义 |
+| [QQ 工具](docs/QQ_TOOLS.md) | 工具参数、会话权限和部分成功处理 |
+| [兼容性](docs/COMPATIBILITY.md) | 上游源码核验基准与升级约束 |
+| [测试与验收](docs/TESTING.md) | 模拟测试记录和真实部署验收步骤 |
+| [开发计划](docs/ROADMAP.md) | 后续工作范围 |
 
-[架构说明](docs/ARCHITECTURE.md) · [群聊上下文](docs/GROUP_CHAT.md) · [图片与媒体](docs/MEDIA.md) · [Agent QQ 工具](docs/QQ_TOOLS.md) · [上游兼容性](docs/COMPATIBILITY.md) · [安全边界](SECURITY.md) · [开发计划](docs/ROADMAP.md)
+许可证：[MIT](LICENSE)。
