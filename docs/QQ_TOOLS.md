@@ -9,7 +9,8 @@
 | `qq_send_message` | 发送文本、图片、@、QQ 表情及引用回复，支持多图和图文交错 |
 | `qq_send_media` | 发送单个图片、语音、视频或文件，可附说明、文件名和视频封面 |
 | `qq_send_forward` | 发送 QQ 合并转发卡片，混合自建多媒体节点与已有消息引用 |
-| `qq_get_message` | 读取一条已核验消息的文本、发送者和附件类型，不返回附件 URL |
+| `qq_get_message` | 读取已核验消息的文本、发送者、附件类型及可用短期图片引用，不返回附件 URL |
+| `qq_get_media` | 同会话按图片引用取图，返回本地路径/MIME/大小；需另用视觉工具读取，不直接调用视觉模型 |
 | `qq_get_chat_info` | 查询当前或获准目标会话的名称与类型 |
 | `qq_get_recent_messages` | 读取获准群的有界近期消息、发言人、时间、引用及历史状态；需要开启 `group_context` |
 
@@ -52,7 +53,7 @@ gateway:
 
 ## 读取近期群消息
 
-`qq_get_recent_messages` 还要求 `group_context.enabled: true`。默认读取当前群；返回文字、稳定发言人 ID、时间、引用、附件类型和窗口状态，不返回媒体 URL，也不读取私人聊天历史。
+`qq_get_recent_messages` 还要求 `group_context.enabled: true`。默认读取当前群；返回文字、稳定发言人 ID、时间、引用、附件类型和窗口状态，可包含短期图片引用，不返回媒体 URL，也不读取私人聊天历史。
 
 ```json
 {"limit": 30}
@@ -79,23 +80,21 @@ group:987654321
 
 ## 多媒体来源
 
-`source` 接受两类值：
+`source` 接受允许目录内的绝对本地路径、通过 `media.outbound` 策略检查的 HTTP(S) URL，显式 `base64://` / `data:<mime>;base64,` 输入，以及同会话 `media:<id>` 图片引用。插件先在 Hermes 侧检查媒体，不把任意 URL 直接交给 NapCat 下载。
 
-- `media.outbound_roots` 下的本地文件
-- 通过现有媒体 host、DNS、重定向、大小和超时检查的 HTTP(S) URL
+已映射的本地文件直接用共享路径；其他已检查媒体可通过 `shared_cache_dir` 复制到专用共享暂存目录，未配置时使用受限 base64，超限时尝试 NapCat 分块上传。共享映射本身不提供挂载或跨主机同步。基础文档发送也支持该传输选择。出站公网模式、媒体大小与 WS 预算、共享暂存/配额的完整配置见 [MEDIA](MEDIA.md)。
 
-插件不会把模型提供的 URL 直接交给 NapCat。它先下载并检查远端内容，然后在 `inline_max_bytes` 范围内转成 base64。大文件使用 `shared_paths` 映射：
+本地图片受 `media.max_bytes` 和文件头检查约束，同时受 `qq_tools.max_local_media_bytes`（默认 256 MiB）限制；其他本地媒体沿用工具大小上限。没有共享目录时，超过实际 inline/WS 预算的文件使用受限分块上传；关闭 streaming 后则拒绝超限文件。
 
-```yaml
-media:
-  outbound_roots: [/srv/qq-output]
-  inline_max_bytes: 524288
-  shared_paths:
-    - hermes: /srv/qq-output
-      napcat: /data/hermes-output
+启用 `media.references.enabled` 后，当前图片注释、`qq_get_message` 或群上下文可能提供 `qqimg_...`。`qq_get_media` 参数为 `{"media_id":"qqimg_实际标识"}`，返回本地 `path`、MIME、字节数和 `source`，模型必须通过可用视觉工具消费该路径才能理解像素。自动引用/近期补图则使用正常 Hermes 媒体事件，详见媒体指南。
+
+原样发回示例：
+
+```json
+{"media_type":"image","source":"media:qqimg_实际标识"}
 ```
 
-`max_local_media_bytes` 默认限制 Agent 工具读取 256 MiB 本地文件，可以在 `qq_tools` 下调整。共享目录只负责让两端看到同一份内容，插件不复制或挂载文件。
+图片引用绑定当前账号与会话，有期限和撤回检查；一般跨会话发送即使已获管理员授权，也不允许跨聊天使用图片引用。缓存路径不因此加入 `outbound_roots`。重启、到期或淘汰后引用不可用；缓存失效后仅通过原文件标识/安全 URL 再取图。
 
 图片说明与图片放在同一条消息。QQ 客户端对语音、视频和文件混合正文的表现不一致，因此插件先发送媒体，再单独发送说明文字。媒体成功而说明失败时，工具返回 `partial: true` 和已知消息 ID；Agent 不应自动重试整个动作。
 
@@ -126,11 +125,13 @@ media:
 }
 ```
 
+图文内容在发送前按整条 UTF-8 JSON / WS 预算预检，超限时按消息段保序拆分；引用只在第一条。任意单段超限会在首条发送前拒绝。单条成功保留 `message_id`，多条成功还返回 `message_ids`。中途失败返回已知 ID、`partial` 和 `delivery_uncertain`，不得重试整批。
+
 直接消息允许 `text`、`image`、`at` 和 `face` 段。插件拒绝 `@all`，也不会解析文本中的 CQ code。
 
 ## 合并转发
 
-`qq_send_forward` 允许两种节点混合出现。
+`qq_send_forward` 允许两种节点混合出现。卡片保持单次动作，不自动拆卡；请求总大小超限时应采用共享目录或减少节点。
 
 已有消息节点：
 
@@ -191,3 +192,5 @@ qq_tools:
 ```
 
 相同 session、当前消息和参数的并发调用会共用同一个正在执行的 action，避免并行工具调度产生重复发送。操作完成后不保留幂等缓存，后续相同请求仍可再次发送。写入后超时或断线会返回 `delivery_uncertain: true`，此时应先检查 QQ 会话。
+
+base64 输入的长度、类型和整批预算，以及分块上传配置见 [STREAM_UPLOAD](STREAM_UPLOAD.md)。

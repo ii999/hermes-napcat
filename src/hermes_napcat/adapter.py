@@ -13,16 +13,21 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from hermes_constants import get_hermes_home
 
-from .media import MediaError, MediaStore
+from .media import MediaError, MediaStore, is_inline_source
+from .media_adapter import MediaAdapterMixin
+from .media_refs import MediaReferences
 from .plugin import settings_from_platform
 from .policy import Policy
-from .protocol import Incoming, ProtocolError, Target, message_id, split_text, text_segments
+from .protocol import (
+    Incoming, ProtocolError, Target, message_batches, message_id, request_bytes,
+    split_text, text_segments,
+)
 from .transport import DeliveryUncertain, OneBotError, OneBotTransport
 
 log = logging.getLogger(__name__)
 
 
-class NapCatAdapter(BasePlatformAdapter):
+class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
     splits_long_messages = True
     supports_code_blocks = False
 
@@ -32,6 +37,9 @@ class NapCatAdapter(BasePlatformAdapter):
         self.policy = Policy(self.settings)
         self.transport = OneBotTransport(self.settings, self._receive if receive_events else self._ignore)
         self.media: MediaStore | None = None
+        self.media_refs = MediaReferences(self.settings.self_id, self.settings.media.references,
+                                          per_message=self.settings.media.max_attachments)
+        self._media_read_gate = asyncio.Lock()
         self._send_gate = asyncio.Lock()
         self._agent_actions: dict[str, asyncio.Task[Any]] = {}
 
@@ -49,10 +57,12 @@ class NapCatAdapter(BasePlatformAdapter):
             return False
 
     async def disconnect(self) -> None:
+        await self._close_streams()
         await self.transport.stop()
         if self.media is not None:
             await self.media.close()
             self.media = None
+        self.media_refs.clear()
         self._mark_disconnected()
 
     @staticmethod
@@ -82,12 +92,16 @@ class NapCatAdapter(BasePlatformAdapter):
         return False
 
     async def _receive(self, raw: dict[str, Any]) -> None:
+        if self._consume_media_recall(raw):
+            return
         try:
             incoming = Incoming.parse(raw)
         except (ProtocolError, ValueError):
             log.warning("Invalid OneBot message rejected; check messagePostFormat=array")
             return
         if incoming is None or not self.policy.can_receive(incoming):
+            return
+        if self.media_refs.is_recalled(incoming.target.address, incoming.message_id):
             return
         key = (incoming.self_id, incoming.target.address, incoming.message_id)
         if self.policy.seen.contains(key):
@@ -138,40 +152,6 @@ class NapCatAdapter(BasePlatformAdapter):
             self.policy.seen.discard(key)
             raise
 
-    async def _attachments(self, incoming: Incoming):
-        paths: list[str] = []
-        mimes: list[str] = []
-        notices: list[str] = []
-        media_parts = [p for p in incoming.segments if p["type"] in ("image", "record", "video", "file")]
-        if media_parts and not self.settings.media.enabled:
-            return paths, mimes, ["[已关闭附件下载，本次未读取附件内容]"]
-        for part in media_parts[:self.settings.media.max_attachments]:
-            kind, data = part["type"], part["data"]
-            url = data.get("url")
-            # OneBot image IDs may require a get_image lookup. Never open a received file path.
-            if not url and kind == "image" and isinstance(data.get("file"), str):
-                try:
-                    info = await self.transport.call("get_image", {"file": data["file"]})
-                    url = info.get("url") if isinstance(info, dict) else None
-                except OneBotError:
-                    pass
-            if not url:
-                notices.append(f"[{kind} 附件没有可访问的 URL，未读取内容]")
-                continue
-            if self.media is None:
-                notices.append(f"[{kind} 附件缓存未就绪]")
-                continue
-            try:
-                downloaded = await self.media.download(url, kind=kind)
-                paths.append(str(downloaded.path))
-                mimes.append(downloaded.mime)
-            except MediaError as exc:
-                log.warning("Inbound media rejected: %s", exc)
-                notices.append(f"[{kind} 附件未读取：下载失败或安全/大小限制]")
-        if len(media_parts) > self.settings.media.max_attachments:
-            notices.append("[附件数量超过本次处理上限，其余附件未读取]")
-        return paths, mimes, notices
-
     def toolsets_for_source(self, source):
         # Safe default for multi-user groups; private sessions use operator-defined platform_toolsets.
         if source.chat_type == "group":
@@ -196,8 +176,12 @@ class NapCatAdapter(BasePlatformAdapter):
     ) -> str:
         if not self.policy.can_send(target):
             raise PermissionError("target is not allowlisted")
+        if request_bytes(action, params) > self.settings.ws_max_bytes:
+            raise MediaError("outbound request exceeds ws_max_bytes; use shared media storage")
         async with self._send_gate:
-            result = await self.transport.call(action, params)
+            self.validate_outbound_media(target, params)
+            result = await self.transport.call(action, params,
+                                               **self.media_send_kwargs(target, params))
             if not isinstance(result, dict) or result.get("message_id") is None:
                 raise DeliveryUncertain("OneBot acknowledged a send without a message ID")
             try:
@@ -230,31 +214,6 @@ class NapCatAdapter(BasePlatformAdapter):
         # A cancelled tool worker must not cancel a send already accepted by the gateway loop.
         return await asyncio.shield(task)
 
-    async def outbound_reference(self, source: str, *, kind: str) -> str:
-        if self.media is None:
-            raise MediaError("media store is not ready")
-        if not isinstance(source, str) or not source.strip():
-            raise MediaError("media source is required")
-        source = source.strip()
-        try:
-            scheme = urlsplit(source).scheme.lower()
-        except ValueError as exc:
-            raise MediaError("invalid media source") from exc
-        if scheme in ("http", "https"):
-            downloaded = await self.media.download(source, kind=kind)
-            return await asyncio.to_thread(self.media.cached_reference, downloaded)
-        windows_drive = len(source) >= 3 and source[0].isalpha() and source[1:3] in (":/", ":\\")
-        if scheme and not windows_drive:
-            raise MediaError("media source must be an allowed local path or http(s) URL")
-
-        def local_reference() -> str:
-            path = self.media.local_path(source)
-            if path.stat().st_size > self.settings.qq_tools.max_local_media_bytes:
-                raise MediaError("local media exceeds qq_tools.max_local_media_bytes")
-            return self.media.outbound_reference(source)
-
-        return await asyncio.to_thread(local_reference)
-
     async def send_agent_media(
         self,
         target: Target,
@@ -265,6 +224,7 @@ class NapCatAdapter(BasePlatformAdapter):
         file_name: str | None = None,
         thumbnail: str | None = None,
         reply_to: str | None = None,
+        requester_id: str | None = None,
     ) -> dict[str, Any]:
         """Send one validated media item and preserve partial-delivery state."""
         if kind not in ("image", "audio", "video", "file"):
@@ -280,31 +240,37 @@ class NapCatAdapter(BasePlatformAdapter):
             reply_to = message_id(reply_to)
         name = file_name
         if kind == "file":
-            name = name or Path(urlsplit(source).path or source).name
+            name = name or ("attachment.bin" if is_inline_source(source)
+                            else Path(urlsplit(source).path or source).name)
             if (not isinstance(name, str) or not name or "/" in name or "\\" in name
                     or len(name) > 200 or name in (".", "..")):
                 raise ValueError("invalid attachment name")
             if reply_to is not None and caption is None:
                 raise ValueError("a file reply requires caption text")
 
-        reference = await self.outbound_reference(source, kind="record" if kind == "audio" else kind)
+        reference = await self.outbound_reference(
+            source, kind="record" if kind == "audio" else kind,
+            target=target, requester_id=requester_id)
         thumb_reference = None
         if thumbnail is not None:
             if kind != "video":
                 raise ValueError("thumbnail is only valid for video")
-            thumb_reference = await self.outbound_reference(thumbnail, kind="image")
+            thumb_reference = await self.outbound_reference(
+                thumbnail, kind="image", target=target, requester_id=requester_id)
 
         ids: list[str] = []
         if kind == "file":
             async with self._send_gate:
+                self.validate_outbound_media(target, reference)
                 upload = await self.transport.call(
                     f"upload_{target.kind}_file",
                     {**target.params, "file": reference, "name": name, "upload_file": True},
+                    **self.media_send_kwargs(target, reference),
                 )
             if caption:
                 try:
                     ids.append(await self._send_parts(target, text_segments(caption, reply_to)))
-                except (OneBotError, ValueError, PermissionError) as exc:
+                except (OneBotError, MediaError, ValueError, PermissionError) as exc:
                     return {
                         "success": False,
                         "partial": True,
@@ -334,7 +300,7 @@ class NapCatAdapter(BasePlatformAdapter):
         if kind in ("audio", "video") and caption:
             try:
                 ids.append(await self._send_parts(target, text_segments(caption)))
-            except (OneBotError, ValueError, PermissionError) as exc:
+            except (OneBotError, MediaError, ValueError, PermissionError) as exc:
                 return {
                     "success": False,
                     "partial": True,
@@ -348,8 +314,23 @@ class NapCatAdapter(BasePlatformAdapter):
     async def send_agent_parts(
         self, target: Target, parts: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        identifier = await self._send_parts(target, parts)
-        return {"success": True, "message_id": identifier}
+        if not self.policy.can_send(target):
+            raise PermissionError("target is not allowlisted")
+        batches = message_batches(target, parts, self.settings.ws_max_bytes)
+        ids: list[str] = []
+        for batch in batches:
+            try:
+                ids.append(await self._send_parts(target, batch))
+            except (OneBotError, MediaError, ValueError, PermissionError) as exc:
+                if not ids:
+                    raise
+                return {"success": False, "partial": True, "message_ids": ids,
+                        "delivery_uncertain": isinstance(exc, DeliveryUncertain),
+                        "error": "QQ message partially delivered; do not retry the entire message"}
+        result = {"success": True, "message_id": ids[-1]}
+        if len(ids) > 1:
+            result["message_ids"] = ids
+        return result
 
     async def send_agent_forward(
         self,
@@ -409,7 +390,7 @@ class NapCatAdapter(BasePlatformAdapter):
             for index, chunk in enumerate(split_text(content, self.settings.message_chars)):
                 ids.append(await self._send_parts(target, text_segments(chunk, reply_to if index == 0 else None)))
             return SendResult(success=True, message_id=ids[-1], continuation_message_ids=tuple(ids[:-1]))
-        except (OneBotError, ValueError, PermissionError) as exc:
+        except (OneBotError, MediaError, ValueError, PermissionError) as exc:
             return self._failure(exc, ids)
 
     async def _send_local_media(self, chat_id, path, kind, caption=None, reply_to=None):
@@ -419,9 +400,11 @@ class NapCatAdapter(BasePlatformAdapter):
                 raise PermissionError("target is not allowlisted")
             if self.media is None:
                 raise MediaError("media store is not ready")
-            reference = await asyncio.to_thread(self.media.outbound_reference, path)
             if caption and len(caption) > self.settings.message_chars:
                 raise ValueError("caption is too long")
+            if reply_to is not None:
+                message_id(reply_to)
+            reference = await self.outbound_reference(str(path), kind=kind)
             parts = text_segments(caption, reply_to) if caption else (
                 [{"type": "reply", "data": {"id": message_id(reply_to)}}] if reply_to else [])
             parts.append({"type": kind, "data": {"file": reference}})
@@ -434,32 +417,7 @@ class NapCatAdapter(BasePlatformAdapter):
         return await self._send_local_media(chat_id, image_path, "image", caption, reply_to)
 
     async def send_image(self, chat_id, image_url, caption=None, reply_to=None, metadata=None):
-        try:
-            target = Target.parse(chat_id)
-            if not self.policy.can_send(target):
-                raise PermissionError("target is not allowlisted")
-            if self.media is None:
-                raise MediaError("media store is not ready")
-            if caption and len(caption) > self.settings.message_chars:
-                raise ValueError("caption is too long")
-            if reply_to is not None:
-                message_id(reply_to)
-            downloaded = await self.media.download(image_url, kind="image")
-            if downloaded.size > self.settings.media.inline_max_bytes:
-                raise MediaError("remote image exceeds inline upload limit")
-            # Downloaded cache files are trusted only on this explicit URL-send path.
-            value = await asyncio.to_thread(downloaded.path.read_bytes)
-            if len(value) > self.settings.media.inline_max_bytes:
-                raise MediaError("remote image exceeds inline upload limit")
-            import base64
-            reference = "base64://" + base64.b64encode(value).decode("ascii")
-            parts = text_segments(caption, reply_to) if caption else (
-                [{"type": "reply", "data": {"id": message_id(reply_to)}}] if reply_to else [])
-            parts.append({"type": "image", "data": {"file": reference}})
-            identifier = await self._send_parts(target, parts)
-            return SendResult(success=True, message_id=identifier)
-        except (OneBotError, MediaError, ValueError, OSError, PermissionError) as exc:
-            return self._failure(exc)
+        return await self._send_local_media(chat_id, image_url, "image", caption, reply_to)
 
     async def send_voice(self, chat_id, audio_path, caption=None, reply_to=None, metadata=None, **kwargs):
         return await self._send_local_media(chat_id, audio_path, "record", caption, reply_to)
@@ -469,35 +427,15 @@ class NapCatAdapter(BasePlatformAdapter):
 
     async def send_document(self, chat_id, file_path, caption=None, file_name=None,
                             reply_to=None, metadata=None, **kwargs):
-        ids = []
         try:
-            target = Target.parse(chat_id)
-            if not self.policy.can_send(target):
-                raise PermissionError("target is not allowlisted")
-            if self.media is None:
-                raise MediaError("media store is not ready")
-            remote = await asyncio.to_thread(self.media.shared_path, file_path)
-            name = file_name or Path(file_path).name
-            if not name or "/" in name or "\\" in name or len(name) > 200:
-                raise ValueError("invalid attachment name")
-            # Validate caption before performing the irreversible file upload.
-            if caption and len(caption) > self.settings.message_chars:
-                raise ValueError("caption is too long")
-            if reply_to is not None:
-                message_id(reply_to)
-            async with self._send_gate:
-                await self.transport.call(f"upload_{target.kind}_file",
-                                          {**target.params, "file": remote, "name": name})
-            if caption:
-                result = await self.send(chat_id, caption, reply_to=reply_to)
-                if not result.success:
-                    return SendResult(success=False, error="File uploaded but caption was not delivered",
-                                      raw_response={"file_uploaded": True})
-                ids.append(result.message_id)
-            return SendResult(success=True, message_id=ids[-1] if ids else None,
-                              raw_response={"file_uploaded": True})
+            result = await self.send_agent_media(
+                Target.parse(chat_id), "file", str(file_path), caption=caption,
+                file_name=file_name, reply_to=reply_to)
+            ids = result.get("message_ids", [])
+            return SendResult(success=result["success"], message_id=ids[-1] if ids else None,
+                              error=result.get("error"), raw_response=result, retryable=False)
         except (OneBotError, MediaError, ValueError, OSError, PermissionError) as exc:
-            return self._failure(exc, ids)
+            return self._failure(exc)
 
     async def get_chat_info(self, chat_id):
         target = Target.parse(chat_id)

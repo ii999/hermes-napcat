@@ -65,6 +65,8 @@ class OneBotTransport:
         self._runner: web.AppRunner | None = None
         self._pending: dict[str, asyncio.Future] = {}
         self._queue: asyncio.Queue = asyncio.Queue(config.event_queue_size)
+        self._recalls: asyncio.Queue = asyncio.Queue(config.event_queue_size)
+        self._queued_event_bytes = 0
         self._workers: list[asyncio.Task] = []
         self._supervisor: asyncio.Task | None = None
         self._reverse_handlers: set[asyncio.Task] = set()
@@ -95,6 +97,7 @@ class OneBotTransport:
         self._stop.clear()
         self._workers = [asyncio.create_task(self._worker(), name=f"napcat-event-{i}")
                          for i in range(self.config.event_workers)]
+        self._workers.append(asyncio.create_task(self._recall_worker(), name="napcat-recalls"))
         try:
             if self.config.mode == "forward":
                 self._session = aiohttp.ClientSession(trust_env=False)
@@ -141,9 +144,12 @@ class OneBotTransport:
         self._workers.clear()
         self._reverse_handlers.clear()
         self._supervisor = None
-        while not self._queue.empty():
-            self._queue.get_nowait()
-            self._queue.task_done()
+        for queue in (self._queue, self._recalls):
+            while not queue.empty():
+                item = queue.get_nowait()
+                if queue is self._queue:
+                    self._queued_event_bytes -= item[1]
+                queue.task_done()
 
     async def _forward_loop(self) -> None:
         delay = self.config.reconnect_min
@@ -243,6 +249,7 @@ class OneBotTransport:
                 self._fail_pending()
 
     async def _receive(self, ws, validated: asyncio.Event, preauth: list[dict]) -> None:
+        preauth_bytes = 0
         async for message in ws:
             if message.type != aiohttp.WSMsgType.TEXT:
                 if message.type == aiohttp.WSMsgType.ERROR:
@@ -265,29 +272,77 @@ class OneBotTransport:
                     future.set_result(payload)
                 else:
                     self.stats.late_responses += 1
-            elif (payload.get("post_type") == "message" or (
-                    self.config.group_context.enabled and payload.get("post_type") == "notice"
-                    and payload.get("notice_type") == "group_recall")):
+            elif payload.get("post_type") == "message" or self._accept_recall(payload):
                 if validated.is_set():
                     self._enqueue(payload)
-                elif len(preauth) < self.config.event_queue_size:
+                elif (len(preauth) < self.config.event_queue_size
+                      and preauth_bytes + len(message.data.encode("utf-8"))
+                      <= self.config.event_queue_max_bytes):
+                    preauth_bytes += len(message.data.encode("utf-8"))
                     preauth.append(payload)
                 else:
                     self.stats.dropped += 1
                     log.warning("Pre-auth event buffer full; message dropped")
         self._fail_pending()
 
+    def _accept_recall(self, event: dict) -> bool:
+        if (event.get("post_type") != "notice"
+                or str(event.get("self_id")) != self.config.self_id):
+            return False
+        kind = event.get("notice_type")
+        if kind not in ("friend_recall", "group_recall"):
+            return False
+        return ((kind == "group_recall" and self.config.group_context.enabled)
+                or (self.config.media.enabled and self.config.media.references.enabled))
+
     def _enqueue(self, event: dict) -> None:
+        # Recalls have their own bounded lane and do not compete with large media events.
+        recall = self._accept_recall(event)
+        queue = self._recalls if recall else self._queue
+        size = 0
+        if recall:
+            event = {key: event[key] for key in (
+                "post_type", "notice_type", "self_id", "group_id", "user_id", "message_id", "operator_id"
+            ) if key in event}
+            if any(not isinstance(value, (str, int)) or len(str(value)) > 64
+                   for value in event.values()):
+                self.stats.malformed += 1
+                return
+        else:
+            try:
+                size = sum(len(part.encode("utf-8")) for part in json.JSONEncoder(
+                    ensure_ascii=False, allow_nan=False, separators=(",", ":")).iterencode(event))
+            except (ValueError, TypeError, RecursionError):
+                self.stats.malformed += 1
+                return
         try:
-            self._queue.put_nowait(event)
+            if not recall and self._queued_event_bytes + size > self.config.event_queue_max_bytes:
+                raise asyncio.QueueFull
+            queue.put_nowait(event if recall else (event, size))
+            self._queued_event_bytes += size
             self.stats.events += 1
         except asyncio.QueueFull:
             self.stats.dropped += 1
-            log.warning("OneBot event queue full; message dropped (OneBot has no durable replay)")
+            log.warning("OneBot event queue byte/count limit reached; event dropped")
+
+    async def _recall_worker(self) -> None:
+        # Separate bounded admission, still outside the response reader and after account auth.
+        # Handlers can invalidate in-flight reads without taking the message's chat lock.
+        while True:
+            event = await self._recalls.get()
+            try:
+                await self.handler(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.stats.handler_errors += 1
+                log.exception("OneBot recall handler failed")
+            finally:
+                self._recalls.task_done()
 
     async def _worker(self) -> None:
         while True:
-            event = await self._queue.get()
+            event, admitted_bytes = await self._queue.get()
             # Serialize adapter admission per conversation, without blocking the WS response reader.
             kind = ("group" if event.get("notice_type") == "group_recall"
                     else event.get("message_type"))
@@ -308,12 +363,19 @@ class OneBotTransport:
                     del self._chat_locks[key]
                 else:
                     self._chat_locks[key] = (lock, count - 1)
+                self._queued_event_bytes -= admitted_bytes
                 self._queue.task_done()
 
     async def call(self, action: str, params: dict[str, Any] | None = None, *,
-                   _handshake: bool = False) -> Any:
+                   _handshake: bool = False, timeout: float | None = None,
+                   expected_epoch: int | None = None,
+                   before_write: Callable[[], None] | None = None) -> Any:
         import uuid
+        if timeout is not None and (not 0 < timeout <= 300):
+            raise ValueError("action timeout must be within (0, 300]")
         ws = self._ws
+        if expected_epoch is not None and self._epoch != expected_epoch:
+            raise NotConnected("OneBot connection changed before action")
         if ws is None or ws.closed or (not _handshake and not self.ready.is_set()):
             raise NotConnected("OneBot is not ready; no action was written")
         echo = f"{self._epoch}:{uuid.uuid4().hex}"
@@ -325,10 +387,13 @@ class OneBotTransport:
         self._pending[echo] = future
         write_started = False
         try:
-            async with asyncio.timeout(self.config.request_timeout):
+            async with asyncio.timeout(timeout if timeout is not None else self.config.request_timeout):
                 async with self._send_lock:
-                    if self._ws is not ws or ws.closed:
+                    if (self._ws is not ws or ws.closed
+                            or (expected_epoch is not None and self._epoch != expected_epoch)):
                         raise NotConnected("OneBot changed before write; no action was written")
+                    if before_write is not None:
+                        before_write()
                     write_started = True
                     await ws.send_str(request)
                 response = await future

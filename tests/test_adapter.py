@@ -8,6 +8,7 @@ import pytest
 from hermes_napcat.media import MediaStore
 from hermes_napcat.plugin import register
 from hermes_napcat.transport import DeliveryUncertain
+from test_media import PNG
 
 
 def make_adapter(hermes_doubles, settings, **kwargs):
@@ -118,8 +119,15 @@ async def test_outbound_media_and_irreversible_upload_validation(hermes_doubles,
     adapter.transport.call.assert_not_called()
     result = await adapter.send_document("group:300", str(file))
     assert result.success and result.raw_response["file_uploaded"]
-    adapter.transport.call.assert_awaited_once_with("upload_group_file", {"group_id": 300, "file": "/data/share/report.txt", "name": "report.txt"})
+    adapter.transport.call.assert_awaited_once()
+    assert adapter.transport.call.await_args.args == (
+        "upload_group_file", {"group_id": 300, "file": "file:///data/share/report.txt",
+                              "name": "report.txt", "upload_file": True})
     adapter.transport.call.reset_mock()
+    result = await adapter.send_image_file("private:200", str(file))
+    assert not result.success
+    adapter.transport.call.assert_not_called()
+    file.write_bytes(PNG)
     result = await adapter.send_image_file("private:200", str(file))
     assert result.success
     assert adapter.transport.call.call_args.args[1]["message"][-1]["data"]["file"] == "file:///data/share/report.txt"
@@ -139,6 +147,6 @@ def test_plugin_registration_exposes_gateway_hooks_and_qq_tools(hermes_doubles):
     assert captured["parse_target_ref_fn"]("private:200") == ("private:200", None)
     assert {item["name"] for item in registered_tools} == {
         "qq_send_message", "qq_send_media", "qq_send_forward", "qq_get_message",
-        "qq_get_chat_info", "qq_get_recent_messages",
+        "qq_get_chat_info", "qq_get_recent_messages", "qq_get_media",
     }
     assert all(item["toolset"] == "napcat_qq" for item in registered_tools)

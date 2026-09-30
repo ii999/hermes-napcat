@@ -29,6 +29,12 @@
 
 启用群聊上下文后增加第六个工具 `qq_get_recent_messages`。群调度使用 `on_processing_start()` 跟踪后台任务，并读取 Hermes 的内部入队标记 `_gateway_accepted`；控制命令绕行调用 `should_bypass_active_session()`，澄清回答通过 `_event_session_key()` 与 `tools.clarify_gateway.get_pending_for_session()` 匹配当前会话。升级 Hermes 时需复核这些接口。后台排队、任务上下文切换和关闭取消有模拟测试覆盖，尚未完成真实 Hermes Gateway 联调。
 
+## 本次媒体扩展（2026-09-30）
+
+基于插件 `741820f` 增加第七个 QQ 工具 `qq_get_media`，沿用现有工具注册与 session 绑定接口；正常媒体事件使用既有 `MessageEvent.media_urls/media_types`。工具 JSON 中的路径不会自动成为视觉输入。没有重新宣称某个更新的 Hermes/NapCat 发行版已实测；真实 Gateway、视觉模型、QQ 客户端、共享目录权限和 32 MiB 图片/10 MiB inline/16 MiB WS 配置仍须部署验收。
+
+两方向 URL 策略、一次 `get_image` URL 刷新和普通多图 WS 预算在本地替身/loopback 测试中验证。不会打开 NapCat 返回的本地路径，已增加分块上传，仍不提供独立 cron 图片发送。详细迁移规则与边界见 [MEDIA](MEDIA.md)。
+
 ## NapCat
 
 网络 schema 与客户端代码核验的是 2026-09-18 获取的 main，不把它当作已在某个发行版上完成实机测试：
@@ -50,3 +56,5 @@ NapCat `v4.18.28` 的发送 schema 支持 node 消息、`source/news/summary/pro
 ## 升级约束
 
 升级 Hermes 后先在其真实 Python 环境运行 scripts/check_hermes_contract.py，再做收发、权限、会话和媒体验收。通过接口签名检查仍可能遇到行为变更。本版不提供对老版缺失插件字段的静默降级，也不会退回源码 patch。
+
+流式上传的当前核验基准为 NapCatQQ `26d7533e0f5800fdff865ab2f2ad7692917e1076`，请求/回执、reset 特性及上游内存合并限制见 [STREAM_UPLOAD](STREAM_UPLOAD.md)。这属于源码核验和模拟服务协议测试，没有宣称真实 QQ 已验收。

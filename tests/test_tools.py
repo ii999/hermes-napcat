@@ -10,6 +10,7 @@ from hermes_napcat.protocol import Target
 from hermes_napcat.tools import ToolSession
 from hermes_napcat import tools
 from hermes_napcat.transport import DeliveryUncertain
+from test_media import PNG
 
 
 def make_adapter(hermes_doubles, settings, tmp_path, **kwargs):
@@ -41,7 +42,7 @@ async def test_rich_message_preserves_order_and_verifies_reply(
     adapter, root = make_adapter(hermes_doubles, settings, tmp_path)
     bind_session(monkeypatch, adapter)
     image = root / "chart.png"
-    image.write_bytes(b"image bytes")
+    image.write_bytes(PNG)
     adapter.transport.call.side_effect = [
         {"message_type": "group", "group_id": 300, "user_id": 200, "message": []},
         {"message_id": 77},
@@ -123,7 +124,7 @@ async def test_forward_mixes_verified_message_and_multimedia_node(
     adapter, root = make_adapter(hermes_doubles, settings, tmp_path)
     bind_session(monkeypatch, adapter)
     image = root / "chart.png"
-    image.write_bytes(b"chart")
+    image.write_bytes(PNG)
     adapter.transport.call.side_effect = [
         {"message_type": "group", "group_id": 300, "user_id": 201, "message": []},
         {"message_id": 88},
@@ -182,8 +183,10 @@ async def test_identical_concurrent_send_is_coalesced(
     release = asyncio.Event()
     calls = 0
 
-    async def call(action, params):
+    async def call(action, params, *, before_write=None):
         nonlocal calls
+        if before_write is not None:
+            before_write()
         calls += 1
         entered.set()
         await release.wait()
@@ -192,7 +195,7 @@ async def test_identical_concurrent_send_is_coalesced(
     adapter.transport.call = call
     args = {"text": "send once"}
     first = asyncio.create_task(tools.qq_send_message(args, session_id="session-1"))
-    await entered.wait()
+    await asyncio.wait_for(entered.wait(), 1)
     second = asyncio.create_task(tools.qq_send_message(args, session_id="session-1"))
     await asyncio.sleep(0)
     assert calls == 1

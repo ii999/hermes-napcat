@@ -17,6 +17,15 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: uv sync --group dev
-      - run: uv run pytest -q
+      - run: uv run pytest -q --junitxml=docs/junit-local.xml
       - run: uv run ruff check .
       - run: uv build
+      - name: Retain test report and installable packages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-and-build-${{ matrix.python }}
+          path: |
+            docs/junit-local.xml
+            dist/
+          retention-days: 7

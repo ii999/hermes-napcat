@@ -16,6 +16,7 @@ from typing import Any
 from .config import Settings
 from .context import GroupContext, GroupMessage
 from .engagement import ParticipationClassifier, WindowBudget, candidate_from_tail
+from .media_refs import MediaReferences
 from .policy import Policy, RecentIDs
 from .protocol import Incoming, Target, message_id
 
@@ -48,11 +49,12 @@ class GroupChatController:
                  dispatch: Callable[[GroupTurn], Awaitable[None]], *,
                  transport_state: Callable[[], tuple[int, int]] = lambda: (0, 0),
                  classifier_key: str = "",
+                 media_refs: MediaReferences | None = None,
                  is_control_reply: Callable[[Incoming, str], bool] = (
                      lambda incoming, text: text.lstrip().startswith("/"))):
         self.settings, self.policy, self.call, self.dispatch = settings, policy, call, dispatch
         self.config, self.proactive = settings.group_context, settings.proactive_assist
-        self.context = GroupContext(settings, policy)
+        self.context = GroupContext(settings, policy, media_refs)
         self.transport_state = transport_state
         self.is_control_reply = is_control_reply
         self.classifier = ParticipationClassifier(self.proactive.classifier, classifier_key)
@@ -229,7 +231,7 @@ class GroupChatController:
                 raise ValueError("unverified quote")
             record = GroupMessage.from_incoming(parsed, self.config.max_message_chars, history=True)
             self.context.put(parsed, history=True)
-            return record
+            return self.context.lookup(address, identifier) or record
         except asyncio.CancelledError:
             raise
         except Exception as exc:

@@ -12,7 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .config import numeric_id
-from .media import MediaError
+from .media import MediaError, inline_info, is_inline_source
 from .protocol import ProtocolError, Target, message_id, segments
 from .transport import ActionError, DeliveryUncertain, NotConnected, OneBotError
 
@@ -112,12 +112,17 @@ def _action_key(tool: str, session: ToolSession, args: dict[str, Any]) -> str:
 async def _on_gateway(tool: str, args: dict[str, Any], operation, *, session_id: str = ""):
     session = _current_session(session_id)
     runner, adapter = _live_adapter(session.profile)
+    if not adapter.policy.authorized_user(session.user_id):
+        raise PermissionError("current user is not authorized to use QQ tools")
     if not adapter.settings.qq_tools.enabled:
         raise PermissionError("model-callable QQ tools are disabled for this profile")
+    _source_budget(adapter, args)
     key = _action_key(tool, session, args)
 
     async def execute():
         target = _authorized_target(adapter, session, args.get("target"))
+        if target != session.target and _has_media_reference(args):
+            raise PermissionError("opaque image references cannot be used across chats")
         return await adapter.run_agent_action(
             key, lambda: operation(adapter, target, session))
 
@@ -138,6 +143,16 @@ async def _on_gateway(tool: str, args: dict[str, Any], operation, *, session_id:
     return await asyncio.shield(asyncio.wrap_future(future))
 
 
+def _has_media_reference(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().startswith(("media:", "qqimg_"))
+    if isinstance(value, dict):
+        return any(_has_media_reference(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_media_reference(item) for item in value)
+    return False
+
+
 def _bounded_text(value: Any, name: str, limit: int, *, required: bool = False) -> str | None:
     if value is None:
         if required:
@@ -153,15 +168,55 @@ def _bounded_text(value: Any, name: str, limit: int, *, required: bool = False) 
     return value
 
 
+def _source_budget(adapter, args: dict[str, Any]) -> None:
+    """Reject oversized inline inputs before action-key serialization or disk/network I/O."""
+    total = 0
+
+    def walk(value, depth=0):
+        nonlocal total
+        if depth > 8:
+            raise ToolRequestError("QQ arguments are too deeply nested")
+        if isinstance(value, str):
+            value = value.strip()
+        if isinstance(value, str) and is_inline_source(value):
+            _, size, _ = inline_info(value, min(adapter.settings.media.base64_max_bytes,
+                                                 adapter.settings.media.max_bytes))
+            total += size
+            if total > adapter.settings.media.base64_batch_max_bytes:
+                raise ToolRequestError("base64 batch exceeds configured byte limit")
+        elif isinstance(value, dict):
+            for item in value.values():
+                walk(item, depth + 1)
+        elif isinstance(value, list):
+            if len(value) > 256:
+                raise ToolRequestError("QQ argument array is too large")
+            for item in value:
+                walk(item, depth + 1)
+
+    walk(args)
+
+
+def _media_source(adapter, value: Any, name: str = "source") -> str:
+    if not isinstance(value, str) or not value:
+        raise ToolRequestError(f"{name} must be a nonempty media source")
+    value = value.strip()
+    if is_inline_source(value):
+        inline_info(value, min(adapter.settings.media.base64_max_bytes, adapter.settings.media.max_bytes))
+        return value
+    return _bounded_text(value, name, 8192, required=True)
+
+
 def _safe_file_name(value: Any, source: str) -> str:
-    name = value if value is not None else Path(urlsplit(source).path or source).name
+    name = value if value is not None else ("attachment.bin" if is_inline_source(source)
+                                           else Path(urlsplit(source).path or source).name)
     if (not isinstance(name, str) or not name or "/" in name or "\\" in name
             or name in (".", "..") or len(name) > 200):
         raise ToolRequestError("invalid attachment name")
     return name
 
 
-async def _direct_parts(adapter, args: dict[str, Any]) -> list[dict[str, Any]]:
+async def _direct_parts(adapter, args: dict[str, Any], *, target: Target | None = None,
+                        requester_id: str | None = None) -> list[dict[str, Any]]:
     raw = args.get("segments")
     text = args.get("text")
     images = args.get("images")
@@ -193,8 +248,9 @@ async def _direct_parts(adapter, args: dict[str, Any]) -> list[dict[str, Any]]:
             chars += len(value)
             parts.append({"type": "text", "data": {"text": value}})
         elif kind == "image":
-            source = _bounded_text(spec.get("source"), "image source", 8192, required=True)
-            reference = await adapter.outbound_reference(source, kind="image")
+            source = _media_source(adapter, spec.get("source"), "image source")
+            reference = await adapter.outbound_reference(
+                source, kind="image", target=target, requester_id=requester_id)
             data = {"file": reference}
             summary = _bounded_text(spec.get("summary"), "image summary", 100)
             if summary:
@@ -220,7 +276,8 @@ async def _direct_parts(adapter, args: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 async def _forward_content(
-    adapter, node: dict[str, Any], totals: dict[str, int],
+    adapter, node: dict[str, Any], totals: dict[str, int], *,
+    target: Target | None = None, requester_id: str | None = None,
 ) -> list[dict[str, Any]]:
     raw = node.get("segments")
     text = node.get("text")
@@ -254,9 +311,10 @@ async def _forward_content(
         if kind not in ("image", "audio", "video", "file"):
             raise ToolRequestError(
                 "forward segments support text, image, audio, video, file, and face")
-        source = _bounded_text(spec.get("source"), f"{kind} source", 8192, required=True)
+        source = _media_source(adapter, spec.get("source"), f"{kind} source")
         media_kind = "record" if kind == "audio" else kind
-        data = {"file": await adapter.outbound_reference(source, kind=media_kind)}
+        data = {"file": await adapter.outbound_reference(
+            source, kind=media_kind, target=target, requester_id=requester_id)}
         if kind == "file":
             data["name"] = _safe_file_name(spec.get("name"), source)
         if kind == "image":
@@ -264,8 +322,9 @@ async def _forward_content(
             if summary:
                 data["summary"] = summary
         if kind == "video" and spec.get("thumbnail") is not None:
-            thumb = _bounded_text(spec.get("thumbnail"), "video thumbnail", 8192, required=True)
-            data["thumb"] = await adapter.outbound_reference(thumb, kind="image")
+            thumb = _media_source(adapter, spec.get("thumbnail"), "video thumbnail")
+            data["thumb"] = await adapter.outbound_reference(
+                thumb, kind="image", target=target, requester_id=requester_id)
         result.append({"type": media_kind, "data": data})
         totals["media"] += 1
     if totals["chars"] > adapter.settings.qq_tools.max_forward_chars:
@@ -324,7 +383,7 @@ async def qq_send_message(args: dict[str, Any], **kwargs) -> dict[str, Any]:
             reply_to = message_id(reply_to)
             await adapter.verified_message(
                 target, reply_to, current_message_id=_current_anchor(session, target))
-        parts = await _direct_parts(adapter, args)
+        parts = await _direct_parts(adapter, args, target=target, requester_id=session.user_id)
         if reply_to is not None:
             parts.insert(0, {"type": "reply", "data": {"id": reply_to}})
         return await adapter.send_agent_parts(target, parts)
@@ -339,7 +398,7 @@ async def qq_send_media(args: dict[str, Any], **kwargs) -> dict[str, Any]:
         kind = args.get("media_type")
         if kind not in ("image", "audio", "video", "file"):
             raise ToolRequestError("media_type must be image, audio, video, or file")
-        source = _bounded_text(args.get("source"), "source", 8192, required=True)
+        source = _media_source(adapter, args.get("source"))
         reply_to = args.get("reply_to")
         if reply_to is not None:
             reply_to = message_id(reply_to)
@@ -353,6 +412,7 @@ async def qq_send_media(args: dict[str, Any], **kwargs) -> dict[str, Any]:
             file_name=args.get("file_name"),
             thumbnail=args.get("thumbnail"),
             reply_to=reply_to,
+            requester_id=session.user_id,
         )
 
     return await _on_gateway(
@@ -390,7 +450,8 @@ async def qq_send_forward(args: dict[str, Any], **kwargs) -> dict[str, Any]:
             if prepared[index] is not None:
                 continue
             label = _bounded_text(node.get("label") or "Hermes", "node label", 64, required=True)
-            content = await _forward_content(adapter, node, totals)
+            content = await _forward_content(
+                adapter, node, totals, target=target, requester_id=session.user_id)
             prepared[index] = {
                 "type": "node",
                 "data": {
@@ -478,10 +539,31 @@ async def qq_get_message(args: dict[str, Any], **kwargs) -> dict[str, Any]:
         identifier = message_id(args.get("message_id"))
         data = await adapter.verified_message(
             target, identifier, current_message_id=_current_anchor(session, target))
-        return _message_summary(data, target, identifier)
+        summary = _message_summary(data, target, identifier)
+        refs = adapter.remember_verified_images(target, identifier, data)
+        if refs:
+            summary["image_refs"] = [ref.summary() for ref in refs]
+        return summary
 
     return await _on_gateway(
         "qq_get_message", args, operation, session_id=str(kwargs.get("session_id") or ""))
+
+
+@_tool_handler
+async def qq_get_media(args: dict[str, Any], **kwargs) -> dict[str, Any]:
+    async def operation(adapter, target, session):
+        if target != session.target:
+            raise PermissionError("image references can only be read in their current conversation")
+        identifier = _bounded_text(args.get("media_id"), "media_id", 128, required=True)
+        identifier = identifier.removeprefix("media:")
+        downloaded = await adapter.resolve_media(identifier, target, session.user_id)
+        return {"success": True, "media_id": identifier, "path": str(downloaded.path),
+                "mime_type": downloaded.mime, "size": downloaded.size,
+                "source": f"media:{identifier}",
+                "usage": "Use the local path with an available vision tool; use source to send it back."}
+
+    return await _on_gateway(
+        "qq_get_media", args, operation, session_id=str(kwargs.get("session_id") or ""))
 
 
 @_tool_handler
@@ -510,7 +592,7 @@ _SEGMENT = {
     "properties": {
         "type": {"type": "string", "enum": ["text", "image", "at", "face"]},
         "text": {"type": "string"},
-        "source": {"type": "string", "description": "Allowed local path or http(s) URL."},
+        "source": {"type": "string", "description": "Absolute allowed path, http(s) URL, base64:// payload, data:<mime>;base64, payload, or same-chat media:<media_id> image. Prefer paths/references over generating base64 text."},
         "summary": {"type": "string"},
         "qq": {"type": "string", "description": "Numeric QQ ID. @all is forbidden."},
         "id": {"type": "string", "description": "Numeric QQ face ID."},
@@ -526,7 +608,7 @@ _FORWARD_SEGMENT = {
             "enum": ["text", "image", "audio", "video", "file", "face"],
         },
         "text": {"type": "string"},
-        "source": {"type": "string", "description": "Allowed local path or http(s) URL."},
+        "source": {"type": "string", "description": "Absolute allowed path, http(s) URL, base64:// payload, data:<mime>;base64, payload, or same-chat media:<media_id> image. Prefer paths/references over generating base64 text."},
         "name": {"type": "string", "description": "Display name for a file."},
         "thumbnail": {"type": "string", "description": "Optional video thumbnail source."},
         "summary": {"type": "string"},
@@ -576,7 +658,7 @@ _TOOLS = {
                     "type": "string",
                     "enum": ["image", "audio", "video", "file"],
                 },
-                "source": {"type": "string", "description": "Allowed local path or http(s) URL."},
+                "source": {"type": "string", "description": "Absolute allowed path, http(s) URL, base64:// payload, data:<mime>;base64, payload, or same-chat media:<media_id> image. Prefer paths/references over generating base64 text."},
                 "caption": {"type": "string"},
                 "file_name": {"type": "string"},
                 "thumbnail": {"type": "string", "description": "Video thumbnail source."},
@@ -625,6 +707,17 @@ _TOOLS = {
             "Inspect one message without exposing attachment URLs or arbitrary chat history.",
             {"target": _TARGET, "message_id": {"type": "string"}},
             ("message_id",),
+        ),
+    ),
+    "qq_get_media": (
+        qq_get_media,
+        "Fetch one short-lived image reference from the current authorized QQ conversation.",
+        _schema(
+            "qq_get_media",
+            "Resolve a media_id from current or recent message context to a local image. "
+            "This does not itself invoke a vision model. Expired, recalled and cross-chat IDs fail.",
+            {"media_id": {"type": "string"}},
+            ("media_id",),
         ),
     ),
     "qq_get_chat_info": (

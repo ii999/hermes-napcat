@@ -1,0 +1,44 @@
+# Merge into an existing Hermes config; preserve account, token, ACL and model settings.
+# Public outbound URLs and bounded image references remain explicit opt-ins.
+# Size/stream values below are the new defaults; keep explicit old limits if required.
+gateway:
+  platforms:
+    napcat:
+      extra:
+        ws_max_bytes: 16777216
+        event_queue_max_bytes: 67108864
+        media:
+          inbound:
+            mode: allowlist
+          outbound:
+            mode: public
+          max_bytes: 33554432
+          timeout: 60
+          streaming:
+            mode: auto
+            max_bytes: 268435456
+            chunk_bytes: 262144
+            timeout: 300
+            max_concurrent: 1
+            file_retention_seconds: 900
+          inline_max_bytes: 10485760
+          references:
+            enabled: true
+            ttl_seconds: 1800
+            max_entries: 1024
+            attach_quoted: true
+            attach_recent: false  # Enable for same-speaker recent images without an explicit quote.
+            recent_seconds: 120
+            recent_limit: 1
+          # Optional: replace paths and mount the same storage into both processes.
+          # outbound_roots: [/srv/qq-output]
+          # shared_paths:
+          #   - hermes: /srv/qq-shared
+          #     napcat: /data/qq-shared
+          # shared_cache_dir: /srv/qq-shared/staging
+        # For untriggered group image references, also enable group_context observation.
+        # group_context:
+        #   enabled: true
+        #   observe_untriggered: true
+        #   observe_all_members: false
+# This does not grant QQ tools or enable proactive participation.

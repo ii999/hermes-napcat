@@ -144,3 +144,33 @@ def split_text(text: str, limit: int) -> list[str]:
     if text:
         result.append(text)
     return result
+
+
+def request_bytes(action: str, params: dict[str, Any]) -> int:
+    """Conservative size using the transport's JSON encoding and a bounded echo reserve."""
+    import json
+
+    return len(json.dumps({"action": action, "params": params, "echo": "0" * 64},
+                          ensure_ascii=False, allow_nan=False,
+                          separators=(",", ":")).encode("utf-8"))
+
+
+def message_batches(target: Target, parts: list[dict[str, Any]], max_bytes: int):
+    """Plan every segment-boundary split before a side-effecting send starts."""
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for part in parts:
+        candidate = [*current, part]
+        if request_bytes(target.action, {**target.params, "message": candidate}) > max_bytes:
+            if not current or all(item["type"] == "reply" for item in current):
+                raise ProtocolError("one media segment exceeds ws_max_bytes; use shared media storage")
+            batches.append(current)
+            candidate = [part]
+            if request_bytes(target.action, {**target.params, "message": candidate}) > max_bytes:
+                raise ProtocolError("one media segment exceeds ws_max_bytes; use shared media storage")
+        current = candidate
+    if current:
+        batches.append(current)
+    if not batches:
+        raise ProtocolError("message requires at least one segment")
+    return batches
