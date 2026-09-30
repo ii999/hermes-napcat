@@ -2,7 +2,17 @@
 
 日期：2026-09-18；版本：0.2.0。运行环境为本次交付容器，不是用户的 QQ 服务器。
 
-## 已执行
+## 媒体扩展回归（2026-09-30）
+
+基线 `741820f` 的本地测试为 126 项。新增分方向策略、共享暂存、链接刷新、受控引用及 WS 拆分后，在 Linux/Python 3.13.5 本地执行 `uv run --no-project --offline pytest -q`，**166 passed**。本机复用已安装的测试依赖；该离线命令不等同于锁文件重建环境。`uv build --offline --no-build-isolation` 成功生成 sdist 和 wheel，并包含新增媒体模块。
+
+新增回归覆盖旧配置继承、公网模式拒绝非公网目标、两方向私网信任隔离、逐跳重定向、共享暂存权限与额度、URL 失效一次刷新、不读取 NapCat 路径、短期引用的账号/会话/期限/撤回/容量限制、同发言人近期补图、无工具引用补图、主动轮次不读图、撤回竞态、排队发送时失效、UTF-8 多图整批预检及部分成功。网络测试使用 loopback 服务，其余使用 Hermes/action/DNS 替身；不是 QQ 或真实 Gateway 联调。
+
+本地没有 Ruff 可执行文件；标准 `uv sync --group dev`、`uv run pytest -q`、`uv run ruff check .` 和 `uv build` 由本 PR 的 Python 3.12/3.13 GitHub Actions 验证，以具体提交的 CI 结果为准。CI 保留 JUnit 报告及构建包 7 天。真实部署验收补充见 [MEDIA](MEDIA.md)。
+
+以下保留 2026-09-18 的历史验收记录，其中的“未执行”指当次环境，不覆盖上述新增本地/CI 记录。
+
+## 原版已执行
 
 在 Linux、Python 3.12.14 环境执行以下命令，**86 passed，0 failed**，Ruff 检查通过：
 

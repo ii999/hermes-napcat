@@ -22,10 +22,12 @@ from hermes_napcat.policy import Policy
 from hermes_napcat.protocol import Incoming, Target, message_batches, request_bytes
 from hermes_napcat.transport import DeliveryUncertain
 from test_adapter import make_adapter
-from test_group_adapter import group_adapter  # noqa: F401 -- pytest fixture
+import test_group_adapter
 from test_group_context import config, event
 from test_media import PNG, file_server
 from test_tools import bind_session
+
+group_adapter = test_group_adapter.group_adapter
 
 
 def image(url="https://gchat.qpic.cn/image", file="opaque.image"):
