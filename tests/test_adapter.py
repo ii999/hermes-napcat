@@ -119,7 +119,10 @@ async def test_outbound_media_and_irreversible_upload_validation(hermes_doubles,
     adapter.transport.call.assert_not_called()
     result = await adapter.send_document("group:300", str(file))
     assert result.success and result.raw_response["file_uploaded"]
-    adapter.transport.call.assert_awaited_once_with("upload_group_file", {"group_id": 300, "file": "file:///data/share/report.txt", "name": "report.txt", "upload_file": True})
+    adapter.transport.call.assert_awaited_once()
+    assert adapter.transport.call.await_args.args == (
+        "upload_group_file", {"group_id": 300, "file": "file:///data/share/report.txt",
+                              "name": "report.txt", "upload_file": True})
     adapter.transport.call.reset_mock()
     result = await adapter.send_image_file("private:200", str(file))
     assert not result.success

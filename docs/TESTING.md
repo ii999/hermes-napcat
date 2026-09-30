@@ -2,6 +2,12 @@
 
 日期：2026-09-18；版本：0.2.0。运行环境为本次交付容器，不是用户的 QQ 服务器。
 
+## PR #3 审查回归（2026-09-30）
+
+macOS/Python 3.12.13 使用项目依赖运行 `uv run pytest -q`，**229 passed**；`uv run ruff check .`、`uv build` 和 `git diff --check` 均通过。新增回归覆盖带首尾空白的 base64/data URI 批次预算、私聊及群聊图片在等待 WebSocket 写锁期间撤回或过期，以及上传返回路径混用斜杠时的父目录跳转和 UNC 拒绝。
+
+WebSocket 测试使用本地 loopback 服务及 Hermes/OneBot 替身。上游流式接口按固定提交做源码核验；未执行真实 NapCat/QQ 或完整 Hermes Gateway 联调。
+
 ## 流式上传与 base64 扩展回归（2026-09-30）
 
 本轮基于 PR #3 的 `fce774b`，在 Linux/Python 3.13.5 使用 `uv run --no-project --offline pytest -q` 复现原有 171 项通过，再运行扩展测试得到 **218 passed**。`uv build --offline --no-build-isolation` 成功生成源码包和 wheel。本地没有 Ruff；本轮代码提交 `4aa43e6` 已通过 Python 3.12/3.13 GitHub Actions 的 `uv sync --group dev`、pytest、Ruff 和构建，见 [CI #27](https://github.com/ii999/hermes-napcat/actions/runs/36708938990)。后续提交以 PR 最新 checks 为准。

@@ -69,7 +69,9 @@ def _hash(stream, size: int) -> str:
 def _remote_path(value: Any, filename: str) -> str:
     if not isinstance(value, str) or not 0 < len(value) <= 4096:
         raise MediaError("stream response contains an invalid remote path")
-    if any(ord(c) < 32 for c in value) or value.startswith(("//", "\\\\")):
+    # Validate the same separators that will be used in the outgoing file URI.
+    value = value.replace("\\", "/")
+    if any(ord(c) < 32 for c in value) or value.startswith("//"):
         raise MediaError("stream response contains an unsafe remote path")
     path = PureWindowsPath(value) if re.match(r"^[A-Za-z]:[/\\]", value) else PurePosixPath(value)
     if not path.is_absolute() or ".." in path.parts or path.name != filename:

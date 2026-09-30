@@ -368,7 +368,8 @@ class OneBotTransport:
 
     async def call(self, action: str, params: dict[str, Any] | None = None, *,
                    _handshake: bool = False, timeout: float | None = None,
-                   expected_epoch: int | None = None) -> Any:
+                   expected_epoch: int | None = None,
+                   before_write: Callable[[], None] | None = None) -> Any:
         import uuid
         if timeout is not None and (not 0 < timeout <= 300):
             raise ValueError("action timeout must be within (0, 300]")
@@ -391,6 +392,8 @@ class OneBotTransport:
                     if (self._ws is not ws or ws.closed
                             or (expected_epoch is not None and self._epoch != expected_epoch)):
                         raise NotConnected("OneBot changed before write; no action was written")
+                    if before_write is not None:
+                        before_write()
                     write_started = True
                     await ws.send_str(request)
                 response = await future

@@ -183,8 +183,10 @@ async def test_identical_concurrent_send_is_coalesced(
     release = asyncio.Event()
     calls = 0
 
-    async def call(action, params):
+    async def call(action, params, *, before_write=None):
         nonlocal calls
+        if before_write is not None:
+            before_write()
         calls += 1
         entered.set()
         await release.wait()
@@ -193,7 +195,7 @@ async def test_identical_concurrent_send_is_coalesced(
     adapter.transport.call = call
     args = {"text": "send once"}
     first = asyncio.create_task(tools.qq_send_message(args, session_id="session-1"))
-    await entered.wait()
+    await asyncio.wait_for(entered.wait(), 1)
     second = asyncio.create_task(tools.qq_send_message(args, session_id="session-1"))
     await asyncio.sleep(0)
     assert calls == 1

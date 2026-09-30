@@ -27,10 +27,12 @@ from test_transport import fake_napcat, ignore, wait_until
 class UploadServer:
     """Match the inspected UploadFileStream.ts response envelope and reset behavior."""
 
-    def __init__(self, *, corrupt=None, delay=0, fail_index=None, fail_send=False):
+    def __init__(self, *, corrupt=None, delay=0, fail_index=None, fail_send=False,
+                 directory='/napcat/temp/'):
         self.files = {}
         self.complete = []
         self.corrupt, self.delay, self.fail_index, self.fail_send = corrupt, delay, fail_index, fail_send
+        self.directory = directory
         self.resets = []
         self.entered = asyncio.Event()
 
@@ -52,7 +54,7 @@ class UploadServer:
                 result = {'type': 'response', 'status': 'file_complete', 'stream_id': sid,
                           'received_chunks': len(state['chunks']), 'total_chunks': state['total'],
                           'file_size': len(data), 'sha256': hashlib.sha256(data).hexdigest(),
-                          'file_path': '/napcat/temp/' + state['name']}
+                          'file_path': self.directory + state['name']}
                 self.complete.append(data)
                 if self.corrupt:
                     result.update(self.corrupt)
@@ -178,13 +180,17 @@ async def test_base64_default_accepts_screenshot_above_old_inline_limit(hermes_d
     assert adapter.transport.call.await_count == 1
 
 
-async def test_base64_batch_budget_before_serialization_or_io(monkeypatch, hermes_doubles, settings, tmp_path):
+@pytest.mark.parametrize('prefix', ['base64://', 'data:image/png;base64,'])
+@pytest.mark.parametrize('padding', ['', ' \t\n'])
+async def test_base64_batch_budget_before_serialization_or_io(
+    monkeypatch, hermes_doubles, settings, tmp_path, prefix, padding,
+):
     adapter = make_adapter(hermes_doubles, settings, qq_tools={'enabled': True}, media={
         'base64_batch_max_bytes': 1024})
     adapter.media = MediaStore(adapter.settings.media, tmp_path / 'cache')
     bind_session(monkeypatch, adapter)
     monkeypatch.setattr(tools, '_action_key', lambda *args: pytest.fail('key serialized before size check'))
-    source = 'base64://' + base64.b64encode(PNG + b'x' * 600).decode()
+    source = padding + prefix + base64.b64encode(PNG + b'x' * 600).decode() + padding
     result = json.loads(await tools.qq_send_message({'images': [source, source]}))
     assert not result['success']
     adapter.transport.call.assert_not_called()
@@ -239,6 +245,23 @@ async def test_bad_stream_completion_does_not_send(hermes_doubles, settings, tmp
         path = root / 'image.png'
         path.write_bytes(PNG + b'x' * 2000)
         assert not (await adapter.send_image_file('private:200', str(path))).success
+        assert not any(r['action'].startswith('send_') for r in server['requests'])
+        assert len(remote.resets) == 1
+
+
+@pytest.mark.parametrize('directory', [
+    '/safe\\..\\outside/', '/\\server/share/', '\\/server/share/',
+])
+async def test_mixed_separator_stream_path_does_not_send(
+    hermes_doubles, settings, tmp_path, directory,
+):
+    async with live_adapter(hermes_doubles, settings, tmp_path,
+                            callback=UploadServer(directory=directory)) as (adapter, root, remote, server):
+        path = root / 'image.png'
+        path.write_bytes(PNG + b'x' * 2000)
+        result = await adapter.send_image_file('private:200', str(path))
+        assert not result.success
+        assert remote.complete == [path.read_bytes()]
         assert not any(r['action'].startswith('send_') for r in server['requests'])
         assert len(remote.resets) == 1
 
@@ -412,12 +435,15 @@ async def test_epoch_pin_survives_waiting_for_transport_send_lock(settings):
             await transport.stop()
 
 
-async def test_data_uri_rich_and_forward_tools(monkeypatch, hermes_doubles, settings, tmp_path):
+@pytest.mark.parametrize('padding', ['', ' \t\n'])
+async def test_data_uri_rich_and_forward_tools(
+    monkeypatch, hermes_doubles, settings, tmp_path, padding,
+):
     adapter = make_adapter(hermes_doubles, settings, qq_tools={'enabled': True})
     adapter.media = MediaStore(adapter.settings.media, tmp_path / 'cache')
     bind_session(monkeypatch, adapter)
     value = PNG + b'x' * 10000
-    source = 'data:image/png;base64,' + base64.b64encode(value).decode()
+    source = padding + 'data:image/png;base64,' + base64.b64encode(value).decode() + padding
     assert json.loads(await tools.qq_send_message({'segments': [
         {'type': 'text', 'text': 'before'}, {'type': 'image', 'source': source},
         {'type': 'text', 'text': 'after'}]}))['success']

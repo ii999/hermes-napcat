@@ -176,6 +176,8 @@ def _source_budget(adapter, args: dict[str, Any]) -> None:
         nonlocal total
         if depth > 8:
             raise ToolRequestError("QQ arguments are too deeply nested")
+        if isinstance(value, str):
+            value = value.strip()
         if isinstance(value, str) and is_inline_source(value):
             _, size, _ = inline_info(value, min(adapter.settings.media.base64_max_bytes,
                                                  adapter.settings.media.max_bytes))
@@ -197,6 +199,7 @@ def _source_budget(adapter, args: dict[str, Any]) -> None:
 def _media_source(adapter, value: Any, name: str = "source") -> str:
     if not isinstance(value, str) or not value:
         raise ToolRequestError(f"{name} must be a nonempty media source")
+    value = value.strip()
     if is_inline_source(value):
         inline_info(value, min(adapter.settings.media.base64_max_bytes, adapter.settings.media.max_bytes))
         return value

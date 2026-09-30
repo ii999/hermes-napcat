@@ -181,7 +181,7 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
         async with self._send_gate:
             self.validate_outbound_media(target, params)
             result = await self.transport.call(action, params,
-                                               **self.media_transport_kwargs(params))
+                                               **self.media_send_kwargs(target, params))
             if not isinstance(result, dict) or result.get("message_id") is None:
                 raise DeliveryUncertain("OneBot acknowledged a send without a message ID")
             try:
@@ -265,7 +265,7 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
                 upload = await self.transport.call(
                     f"upload_{target.kind}_file",
                     {**target.params, "file": reference, "name": name, "upload_file": True},
-                    **self.media_transport_kwargs(reference),
+                    **self.media_send_kwargs(target, reference),
                 )
             if caption:
                 try:

@@ -2,16 +2,72 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from hermes_napcat.media import MediaStore
-from hermes_napcat.protocol import Target
+from hermes_napcat.media import MediaError, MediaStore
+from hermes_napcat.protocol import Incoming, Target
 from hermes_napcat.transport import OneBotTransport
 from test_adapter import make_adapter
+import test_group_adapter
 from test_media_upgrade import image, owned
 from test_transport import fake_napcat, ignore, wait_until
+
+group_adapter = test_group_adapter.group_adapter
+
+
+@pytest.mark.parametrize("kind", ["private", "group"])
+@pytest.mark.parametrize("invalidation", ["recall", "expiry"])
+async def test_queued_image_is_revalidated_at_websocket_write(
+    monkeypatch, hermes_doubles, group_adapter, settings, raw_event, tmp_path,
+    kind, invalidation,
+):
+    async with fake_napcat() as server:
+        options = {"ws_url": server["url"], "token": settings().token,
+                   "media": {"references": {"enabled": True}}}
+        adapter = (group_adapter(**options) if kind == "group"
+                   else make_adapter(hermes_doubles, settings, **options))
+        adapter.media = MediaStore(adapter.settings.media, tmp_path / "cache")
+        adapter.transport = OneBotTransport(adapter.settings, adapter._receive)
+        incoming = Incoming.parse(raw_event(message_type=kind, group_id=300, message=[image()]))
+        ref = adapter.media_refs.remember(incoming)[0]
+        adapter.media_refs.set_downloaded(ref.media_id, incoming.target, owned(adapter.media))
+        source = await adapter.outbound_reference(
+            f"media:{ref.media_id}", kind="image", target=incoming.target, requester_id="200")
+        send = None
+        try:
+            await adapter.transport.start()
+            await adapter.transport._send_lock.acquire()
+            send = asyncio.create_task(adapter.send_agent_parts(
+                incoming.target, [{"type": "image", "data": {"file": source}}]))
+            await wait_until(lambda: adapter.transport.pending_count == 1)
+            if invalidation == "recall":
+                await server["ws"].send_json({
+                    "post_type": "notice", "self_id": 100, "message_id": incoming.message_id,
+                    "notice_type": "group_recall" if kind == "group" else "friend_recall",
+                    "group_id": 300, "user_id": 200,
+                })
+                await wait_until(lambda: adapter.media_refs.is_recalled(
+                    incoming.target.address, incoming.message_id))
+            else:
+                expired_at = time.time() + adapter.settings.media.references.ttl_seconds + 1
+                monkeypatch.setattr("hermes_napcat.media_refs.time",
+                                    SimpleNamespace(time=lambda: expired_at))
+            adapter.transport._send_lock.release()
+            with pytest.raises(MediaError):
+                await send
+            assert not any(r["action"].startswith("send_") for r in server["requests"])
+            assert adapter.transport.pending_count == 0
+        finally:
+            if adapter.transport._send_lock.locked():
+                adapter.transport._send_lock.release()
+            if send is not None and not send.done():
+                send.cancel()
+                await asyncio.gather(send, return_exceptions=True)
+            await adapter.disconnect()
 
 
 @pytest.mark.parametrize("kind", ["private", "group"])

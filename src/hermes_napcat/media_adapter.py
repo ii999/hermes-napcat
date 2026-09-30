@@ -285,6 +285,11 @@ class MediaAdapterMixin:
             for item in value:
                 self.validate_outbound_media(target, item)
 
+    def media_send_kwargs(self, target: Target, value: Any) -> dict[str, Any]:
+        """Recheck capabilities after the transport lock wait, immediately before writing."""
+        return {**self.media_transport_kwargs(value),
+                "before_write": lambda: self.validate_outbound_media(target, value)}
+
     def media_transport_kwargs(self, value: Any) -> dict[str, int]:
         """Pin sends of staged files to their original WS epoch, including lock wait."""
         if isinstance(value, ReferencedMedia):
