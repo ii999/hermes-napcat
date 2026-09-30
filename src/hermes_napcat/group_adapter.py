@@ -12,7 +12,8 @@ from gateway.platforms.event import MessageEvent, MessageType
 from .adapter import NapCatAdapter
 from .context import _timestamp
 from .group_chat import GroupChatController, GroupTurn
-from .protocol import Incoming, Target, message_id
+from .media import MediaError
+from .protocol import Incoming, Target, message_id, request_bytes
 from .transport import DeliveryUncertain
 
 
@@ -39,7 +40,7 @@ class GroupNapCatAdapter(NapCatAdapter):
             self.settings, self.policy,
             lambda action, params: self.transport.call(action, params), self._dispatch_group,
             transport_state=lambda: (self.transport.connection_epoch, self.transport.stats.dropped),
-            classifier_key=self._classifier_key,
+            classifier_key=self._classifier_key, media_refs=self.media_refs,
             is_control_reply=self._is_control_reply,
         )
 
@@ -187,7 +188,10 @@ class GroupNapCatAdapter(NapCatAdapter):
                                    params: dict[str, Any]) -> str:
         if not self.policy.can_send(target):
             raise PermissionError("target is not allowlisted")
+        if request_bytes(action, params) > self.settings.ws_max_bytes:
+            raise MediaError("outbound request exceeds ws_max_bytes; use shared media storage")
         async with self._send_gate:
+            self.validate_outbound_media(target, params)
             self.groups.before_send(target)  # After waiting for the send gate, before any write.
             result = await self.transport.call(action, params)
             if not isinstance(result, dict) or result.get("message_id") is None:

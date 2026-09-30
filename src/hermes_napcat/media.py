@@ -9,11 +9,12 @@ import os
 import re
 import socket
 import stat
+import threading
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import aiohttp
 from aiohttp.abc import AbstractResolver
@@ -48,7 +49,9 @@ def origin(url: str) -> str:
 def public_ip(text: str) -> bool:
     address = ipaddress.ip_address(text)
     mapped = getattr(address, "ipv4_mapped", None)
-    return (mapped or address).is_global
+    address = mapped or address
+    return (address.is_global and not address.is_multicast and not address.is_reserved
+            and not address.is_unspecified)
 
 
 class SafeResolver(AbstractResolver):
@@ -83,12 +86,34 @@ class MediaStore:
             raise MediaError("media cache must not be a symlink")
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.root = root.resolve()
-        self._private_origins = {origin(value) for value in config.trusted_private_origins}
-        self._private_hosts = {urlsplit(value).hostname for value in self._private_origins}
+        self._policies = {name: config.download_policy(name) for name in ("inbound", "outbound")}
+        self._private_origins = {
+            name: {origin(value) for value in policy.trusted_private_origins}
+            for name, policy in self._policies.items()
+        }
+        self._private_hosts = {
+            name: {urlsplit(value).hostname for value in origins}
+            for name, origins in self._private_origins.items()
+        }
+        self.shared_root: Path | None = None
+        if config.shared_cache_dir is not None:
+            shared = config.shared_cache_dir.expanduser().absolute()
+            if shared.is_symlink():
+                raise MediaError("shared media cache must not be a symlink")
+            shared.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.shared_root = shared.resolve()
+            if not any(self.shared_root.is_relative_to(m.hermes.expanduser().resolve())
+                       for m in config.shared_paths):
+                raise MediaError("shared media cache escapes its configured mapping")
+        # Covers synchronous local-send entry points as well as asynchronous cache I/O.
+        self._storage_lock = threading.RLock()
+        self._reserved_bytes = 0
         self._lock = asyncio.Lock()
         self._session: aiohttp.ClientSession | None = None
+        self._outbound_session: aiohttp.ClientSession | None = None
 
-    def validate_url(self, url: str) -> str:
+    def validate_url(self, url: str, *, direction: str = "inbound") -> str:
+        policy = self._policies[direction]
         if not isinstance(url, str) or len(url) > 8192 or any(c.isspace() for c in url):
             raise MediaError("invalid media URL")
         try:
@@ -100,10 +125,10 @@ class MediaStore:
                 parsed.password or parsed.fragment):
             raise MediaError("media URL must use http(s), without userinfo or fragment")
         host = parsed.hostname.lower().rstrip(".")
-        trusted = current_origin in self._private_origins
-        if host in self._private_hosts and not trusted:
+        trusted = current_origin in self._private_origins[direction]
+        if host in self._private_hosts[direction] and not trusted:
             raise MediaError("private media service origin does not match its configured origin")
-        if not trusted and host not in self.config.allowed_hosts:
+        if not trusted and policy.mode == "allowlist" and host not in policy.allowed_hosts:
             raise MediaError("media host is not allowlisted")
         with contextlib.suppress(ValueError):
             if not trusted and not public_ip(host):
@@ -111,49 +136,64 @@ class MediaStore:
         return url
 
     def _owned_files(self):
-        for path in self.root.iterdir():
-            if not _OWN_FILE.fullmatch(path.name):
+        for root in dict.fromkeys((self.root, self.shared_root)):
+            if root is None:
                 continue
-            metadata = path.lstat()
-            if stat.S_ISREG(metadata.st_mode):
-                yield path, metadata
+            for path in root.iterdir():
+                if not _OWN_FILE.fullmatch(path.name):
+                    continue
+                metadata = path.lstat()
+                if stat.S_ISREG(metadata.st_mode):
+                    yield path, metadata
 
     def _prune_and_usage(self) -> int:
-        usage = 0
-        cutoff = time.time() - self.config.cache_ttl_seconds
-        for path, metadata in self._owned_files():
-            if metadata.st_mtime < cutoff:
-                path.unlink()
-            else:
-                usage += metadata.st_size
-        return usage
+        with self._storage_lock:
+            usage = 0
+            cutoff = time.time() - self.config.cache_ttl_seconds
+            for path, metadata in self._owned_files():
+                if metadata.st_mtime < cutoff:
+                    path.unlink(missing_ok=True)
+                else:
+                    usage += metadata.st_size
+            return usage
 
-    async def download(self, url: str, *, kind: str) -> Downloaded:
+    async def download(self, url: str, *, kind: str, direction: str = "inbound") -> Downloaded:
         if not self.config.enabled:
             raise MediaError("media download is disabled")
+        if direction not in self._policies:
+            raise MediaError("unknown media download direction")
         # Hold a reservation for the entire transfer. No concurrent cache quota overcommit.
         async with self._lock:
-            usage = await asyncio.to_thread(self._prune_and_usage)
-            if usage + self.config.max_bytes > self.config.cache_max_bytes:
-                raise MediaError("media cache quota reached; existing recent files are retained")
-            if self._session is None:
-                connector = aiohttp.TCPConnector(
-                    resolver=SafeResolver(self._private_hosts), use_dns_cache=False, limit=4)
-                self._session = aiohttp.ClientSession(
-                    connector=connector, trust_env=False, auto_decompress=False,
-                    timeout=aiohttp.ClientTimeout(total=self.config.timeout),
-                )
+            with self._storage_lock:
+                usage = self._prune_and_usage()
+                if usage + self.config.max_bytes > self.config.cache_max_bytes:
+                    raise MediaError("media cache quota reached; existing recent files are retained")
+                self._reserved_bytes = self.config.max_bytes
             try:
+                attribute = "_session" if direction == "inbound" else "_outbound_session"
+                if getattr(self, attribute) is None:
+                    connector = aiohttp.TCPConnector(
+                        resolver=SafeResolver(self._private_hosts[direction]),
+                        use_dns_cache=False, limit=4)
+                    session = aiohttp.ClientSession(
+                        connector=connector, trust_env=False, auto_decompress=False,
+                        timeout=aiohttp.ClientTimeout(total=self.config.timeout),
+                    )
+                    setattr(self, attribute, session)
                 async with asyncio.timeout(self.config.timeout):
-                    return await self._download(url, kind)
+                    return await self._download(url, kind, direction)
             except (aiohttp.ClientError, TimeoutError, OSError) as exc:
                 raise MediaError(f"media transfer failed ({type(exc).__name__})") from exc
+            finally:
+                with self._storage_lock:
+                    self._reserved_bytes = 0
 
-    async def _download(self, url: str, kind: str) -> Downloaded:
-        assert self._session is not None
+    async def _download(self, url: str, kind: str, direction: str = "inbound") -> Downloaded:
+        session = self._session if direction == "inbound" else self._outbound_session
+        assert session is not None
         for _ in range(4):
-            self.validate_url(url)
-            async with self._session.get(url, allow_redirects=False) as response:
+            self.validate_url(url, direction=direction)
+            async with session.get(url, allow_redirects=False) as response:
                 if response.status in (301, 302, 303, 307, 308):
                     location = response.headers.get("Location")
                     if not location:
@@ -213,7 +253,10 @@ class MediaStore:
         return None
 
     def local_path(self, path: str) -> Path:
-        candidate = Path(path).expanduser().resolve(strict=True)
+        supplied = Path(path).expanduser()
+        if not supplied.is_absolute():
+            raise MediaError("outbound media path must be absolute")
+        candidate = supplied.resolve(strict=True)
         roots = [*self.config.outbound_roots, *(m.hermes for m in self.config.shared_paths)]
         if not any(candidate.is_relative_to(root.expanduser().resolve()) for root in roots):
             raise MediaError("outbound file is outside configured media roots")
@@ -231,34 +274,96 @@ class MediaStore:
                 return mapping.napcat.rstrip("/\\") + "/" + candidate.relative_to(root).as_posix()
         raise MediaError("this operation requires a configured shared_paths mapping")
 
-    def outbound_reference(self, path: str) -> str:
-        candidate = self.local_path(path)
+    @staticmethod
+    def _file_uri(remote: str) -> str:
+        remote = remote.replace("\\", "/")
+        return "file://" + ("" if remote.startswith("/") else "/") + quote(remote, safe="/:")
+
+    def _mapped_reference(self, candidate: Path) -> str | None:
         try:
-            remote = self.shared_path(path).replace("\\", "/")
-            return "file://" + ("" if remote.startswith("/") else "/") + remote
+            return self._file_uri(self.shared_path(str(candidate)))
         except MediaError:
-            pass
-        with candidate.open("rb") as stream:
-            value = stream.read(self.config.inline_max_bytes + 1)
-        if len(value) > self.config.inline_max_bytes:
-            raise MediaError("file exceeds inline limit; configure shared_paths for larger files")
-        return "base64://" + base64.b64encode(value).decode("ascii")
+            return None
+
+    def _reference(self, candidate: Path, size: int) -> str:
+        with self._storage_lock:
+            mapped = self._mapped_reference(candidate)
+            if mapped is not None:
+                return mapped
+            if self.shared_root is not None:
+                # Keep staging ownership narrow; never expose the entire inbound cache.
+                if self.shared_root.is_symlink() or self.shared_root.resolve() != self.shared_root:
+                    raise MediaError("shared media cache changed or became a symlink")
+                usage = self._prune_and_usage()
+                if usage + self._reserved_bytes + size > self.config.cache_max_bytes:
+                    raise MediaError("shared media cache quota reached")
+                suffix = candidate.suffix.lower()
+                if suffix not in _EXTENSIONS.values():
+                    suffix = ".bin"
+                name = f"napcat_{uuid.uuid4().hex}{suffix}"
+                temporary = self.shared_root / (name + ".part")
+                destination = self.shared_root / name
+                try:
+                    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    copied = 0
+                    with os.fdopen(descriptor, "wb") as output, candidate.open("rb") as source:
+                        while chunk := source.read(min(64 * 1024, size + 1 - copied)):
+                            copied += len(chunk)
+                            if copied > size:
+                                raise MediaError("media changed while staging")
+                            output.write(chunk)
+                    if copied != size:
+                        raise MediaError("media changed while staging")
+                    os.replace(temporary, destination)
+                    mapped = self._mapped_reference(destination)
+                    if mapped is None:
+                        raise MediaError("shared media cache no longer has a valid mapping")
+                    return mapped
+                except BaseException:
+                    destination.unlink(missing_ok=True)
+                    raise
+                finally:
+                    temporary.unlink(missing_ok=True)
+            with candidate.open("rb") as stream:
+                value = stream.read(self.config.inline_max_bytes + 1)
+            if len(value) > self.config.inline_max_bytes:
+                raise MediaError(
+                    "media exceeds inline upload limit; configure shared_cache_dir/shared_paths "
+                    "or raise inline_max_bytes together with ws_max_bytes")
+            if len(value) != size:
+                raise MediaError("media changed before upload")
+            return "base64://" + base64.b64encode(value).decode("ascii")
+
+    def outbound_reference(self, path: str, *, kind: str | None = None,
+                           max_bytes: int | None = None) -> str:
+        candidate = self.local_path(path)
+        size = candidate.stat().st_size
+        limits = [limit for limit in (max_bytes, self.config.max_bytes if kind == "image" else None)
+                  if limit is not None]
+        if limits and size > min(limits):
+            raise MediaError("local media exceeds configured byte limit")
+        if kind == "image":
+            with candidate.open("rb") as stream:
+                if self._image_mime(stream.read(16)) is None:
+                    raise MediaError("unsupported or invalid image bytes")
+        return self._reference(candidate, size)
+
+    def validate_cached(self, downloaded: Downloaded) -> Path:
+        """Validate one explicit cache object; a cache path alone grants no access."""
+        candidate = downloaded.path.resolve(strict=True)
+        if (downloaded.path.is_symlink() or candidate.parent != self.root
+                or not _OWN_FILE.fullmatch(candidate.name) or not candidate.is_file()):
+            raise MediaError("downloaded media is not owned by this cache")
+        if candidate.stat().st_size != downloaded.size:
+            raise MediaError("downloaded media changed before upload")
+        return candidate
 
     def cached_reference(self, downloaded: Downloaded) -> str:
-        """Encode one file produced by this store, without widening outbound roots."""
-        candidate = downloaded.path.resolve(strict=True)
-        if (candidate.parent != self.root or not _OWN_FILE.fullmatch(candidate.name)
-                or not candidate.is_file()):
-            raise MediaError("downloaded media is not owned by this cache")
-        if downloaded.size > self.config.inline_max_bytes:
-            raise MediaError("downloaded media exceeds inline upload limit")
-        with candidate.open("rb") as stream:
-            value = stream.read(self.config.inline_max_bytes + 1)
-        if len(value) != downloaded.size or len(value) > self.config.inline_max_bytes:
-            raise MediaError("downloaded media changed or exceeds inline upload limit")
-        return "base64://" + base64.b64encode(value).decode("ascii")
+        return self._reference(self.validate_cached(downloaded), downloaded.size)
 
     async def close(self) -> None:
-        if self._session is not None:
-            await self._session.close()
-            self._session = None
+        for attribute in ("_session", "_outbound_session"):
+            session = getattr(self, attribute)
+            if session is not None:
+                await session.close()
+                setattr(self, attribute, None)

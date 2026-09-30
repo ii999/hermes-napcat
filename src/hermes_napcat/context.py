@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config import GroupContextSettings, Settings, numeric_id
+from .media_refs import MediaReferences
 from .policy import Policy, RecentIDs
 from .protocol import Incoming, Target, message_id
 
@@ -38,6 +39,7 @@ class GroupMessage:
     time_inferred: bool = False
     truncated: bool = False
     own: bool = False
+    image_refs: tuple[tuple[str, int], ...] = ()
 
     @classmethod
     def from_incoming(cls, incoming: Incoming, limit: int, *, history: bool = False):
@@ -78,6 +80,8 @@ class GroupMessage:
             "mentions": list(self.mentions), "reply_to": self.reply_to,
             "attachments": list(self.attachments), "text_truncated": self.truncated,
             "bot": self.own,
+            "image_refs": [{"media_id": identifier, "image_index": index, "type": "image"}
+                           for identifier, index in self.image_refs],
         }
 
 
@@ -92,7 +96,10 @@ class RoomContext:
 class GroupContext:
     """Each instance belongs to one adapter/profile/account; keys are typed chat addresses."""
 
-    def __init__(self, settings: Settings, policy: Policy):
+    def __init__(self, settings: Settings, policy: Policy,
+                 media_refs: MediaReferences | None = None):
+        self.media_refs = media_refs or MediaReferences(
+            settings.self_id, settings.media.references, per_message=settings.media.max_attachments)
         self.settings = settings
         self.config: GroupContextSettings = settings.group_context
         self.policy = policy
@@ -132,6 +139,9 @@ class GroupContext:
         room = self.room(incoming.target.address)
         if record.message_id in room.messages:
             return False  # Backfill and echoes never overwrite a live observation.
+        if self.settings.media.enabled:
+            refs = self.media_refs.remember(incoming, timestamp=record.timestamp)
+            record = replace(record, image_refs=tuple((r.media_id, r.image_index) for r in refs))
         room.messages[record.message_id] = record
         # Retain newest event-time records, not the last records ingested by a backfill.
         ordered = sorted(room.messages.values(), key=lambda item: item.timestamp)
@@ -149,6 +159,7 @@ class GroupContext:
     def recall(self, address: str, identifier: str) -> None:
         identifier = message_id(identifier)
         self.recalled.add((address, identifier))
+        self.media_refs.recall(Target.parse(address), identifier)
         room = self.room(address)
         room.messages.pop(identifier, None)
         self._revision += 1
@@ -249,4 +260,5 @@ class GroupContext:
         return text, result, truncated
 
     def clear(self) -> None:
+        self.media_refs.clear()
         self.rooms.clear()

@@ -10,6 +10,7 @@ from hermes_napcat.protocol import Target
 from hermes_napcat.tools import ToolSession
 from hermes_napcat import tools
 from hermes_napcat.transport import DeliveryUncertain
+from test_media import PNG
 
 
 def make_adapter(hermes_doubles, settings, tmp_path, **kwargs):
@@ -41,7 +42,7 @@ async def test_rich_message_preserves_order_and_verifies_reply(
     adapter, root = make_adapter(hermes_doubles, settings, tmp_path)
     bind_session(monkeypatch, adapter)
     image = root / "chart.png"
-    image.write_bytes(b"image bytes")
+    image.write_bytes(PNG)
     adapter.transport.call.side_effect = [
         {"message_type": "group", "group_id": 300, "user_id": 200, "message": []},
         {"message_id": 77},
@@ -123,7 +124,7 @@ async def test_forward_mixes_verified_message_and_multimedia_node(
     adapter, root = make_adapter(hermes_doubles, settings, tmp_path)
     bind_session(monkeypatch, adapter)
     image = root / "chart.png"
-    image.write_bytes(b"chart")
+    image.write_bytes(PNG)
     adapter.transport.call.side_effect = [
         {"message_type": "group", "group_id": 300, "user_id": 201, "message": []},
         {"message_id": 88},

@@ -51,20 +51,14 @@ class SharedPath(StrictModel):
         return self
 
 
-class MediaSettings(StrictModel):
-    enabled: bool = True
+class MediaURLPolicy(StrictModel):
+    """One download direction; public never implies private-network access."""
+
+    mode: Literal["allowlist", "public"] = "allowlist"
     allowed_hosts: tuple[str, ...] = (
         "multimedia.nt.qq.com", "gchat.qpic.cn", "c2cpicdw.qpic.cn", "grouptalk.c2c.qq.com",
     )
     trusted_private_origins: tuple[str, ...] = ()
-    max_bytes: int = Field(default=10 * 1024 * 1024, ge=1024, le=256 * 1024 * 1024)
-    max_attachments: int = Field(default=4, ge=1, le=16)
-    timeout: float = Field(default=30, gt=0, le=300)
-    cache_max_bytes: int = Field(default=512 * 1024 * 1024, ge=1024)
-    cache_ttl_seconds: int = Field(default=86400, ge=3600)
-    outbound_roots: tuple[Path, ...] = ()
-    shared_paths: tuple[SharedPath, ...] = ()
-    inline_max_bytes: int = Field(default=512 * 1024, ge=1024, le=32 * 1024 * 1024)
 
     @field_validator("allowed_hosts")
     @classmethod
@@ -92,10 +86,54 @@ class MediaSettings(StrictModel):
             result.append(origin.rstrip("/").lower())
         return tuple(result)
 
+
+class MediaReferenceSettings(StrictModel):
+    """Opt-in, bounded metadata retention; no background image downloads."""
+
+    enabled: bool = False
+    ttl_seconds: int = Field(default=1800, ge=30, le=86400)
+    max_entries: int = Field(default=1024, ge=16, le=16384)
+    attach_quoted: bool = True
+    attach_recent: bool = False
+    recent_seconds: int = Field(default=120, ge=1, le=3600)
+    recent_limit: int = Field(default=1, ge=1, le=4)
+
+
+class MediaSettings(MediaURLPolicy):
+    enabled: bool = True
+    # Unset directions inherit legacy top-level policy fields, without broadening access.
+    inbound: MediaURLPolicy | None = None
+    outbound: MediaURLPolicy | None = None
+    references: MediaReferenceSettings = Field(default_factory=MediaReferenceSettings)
+    shared_cache_dir: Path | None = None
+    max_bytes: int = Field(default=10 * 1024 * 1024, ge=1024, le=256 * 1024 * 1024)
+    max_attachments: int = Field(default=4, ge=1, le=16)
+    timeout: float = Field(default=30, gt=0, le=300)
+    cache_max_bytes: int = Field(default=512 * 1024 * 1024, ge=1024)
+    cache_ttl_seconds: int = Field(default=86400, ge=3600)
+    outbound_roots: tuple[Path, ...] = ()
+    shared_paths: tuple[SharedPath, ...] = ()
+    inline_max_bytes: int = Field(default=512 * 1024, ge=1024, le=32 * 1024 * 1024)
+
+    def download_policy(self, direction: Literal["inbound", "outbound"]) -> MediaURLPolicy:
+        if direction not in ("inbound", "outbound"):
+            raise ValueError("unknown media download direction")
+        configured = getattr(self, direction)
+        return configured if configured is not None else MediaURLPolicy(
+            mode=self.mode, allowed_hosts=self.allowed_hosts,
+            trusted_private_origins=self.trusted_private_origins,
+        )
+
     @model_validator(mode="after")
     def valid_storage(self):
         if self.cache_max_bytes < self.max_bytes:
             raise ValueError("cache_max_bytes must be at least max_bytes")
+        if self.shared_cache_dir is not None:
+            path = self.shared_cache_dir
+            if not path.is_absolute() or path == Path(path.anchor):
+                raise ValueError("shared_cache_dir must be an absolute, dedicated directory")
+            if not any(path.is_relative_to(mapping.hermes) for mapping in self.shared_paths):
+                raise ValueError("shared_cache_dir requires a containing shared_paths mapping")
         for path in self.outbound_roots:
             if not path.is_absolute() or path == Path(path.anchor):
                 raise ValueError("outbound_roots must contain dedicated absolute directories")
@@ -273,7 +311,7 @@ class Settings(StrictModel):
             raise ValueError("ws_path must be an absolute URL path")
         if self.reconnect_max < self.reconnect_min:
             raise ValueError("reconnect_max must be >= reconnect_min")
-        if self.media.inline_max_bytes * 4 // 3 + 16384 > self.ws_max_bytes:
+        if 4 * ((self.media.inline_max_bytes + 2) // 3) + 16384 > self.ws_max_bytes:
             raise ValueError("ws_max_bytes must fit base64-encoded inline_max_bytes plus overhead")
         if not self.allow_all_users and not set(self.admins).issubset(self.allowed_users):
             raise ValueError("admins must also appear in allowed_users")
