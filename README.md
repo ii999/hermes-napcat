@@ -8,8 +8,6 @@ QQ ↔ NapCat ↔ OneBot v11 WebSocket ↔ Hermes NapCat Plugin ↔ Hermes Gatew
 
 支持文本、图片、语音、视频、文件和合并转发，并可按需启用群聊背景、主动参与及 QQ 工具。插件以独立 Python 包和 Hermes 目录插件安装，不修改 Hermes 核心代码，也不依赖 NapCat HTTP API。
 
-**当前版本：0.2.0。真实 QQ 与完整 Hermes Gateway 联调尚待验收。** 本地测试使用模拟 Hermes/OneBot 接口及 loopback HTTP/WebSocket 服务；Hermes 接口已按 `v2026.9.14`（0.21.3）做源码核验。音视频播放、视觉模型、STT/TTS 和实际部署兼容性需要在目标环境验证。详见 [测试记录](docs/TESTING.md) 和 [上游兼容性](docs/COMPATIBILITY.md)。
-
 ## 功能概览
 
 | 能力 | 支持范围 |
