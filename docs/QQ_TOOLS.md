@@ -1,20 +1,22 @@
 # Agent QQ 工具
 
-`napcat_qq` 工具集让 Hermes Agent 使用当前 Gateway 的 NapCat WebSocket 连接操作 QQ。工具不建立第二条连接，也不接受任意 OneBot action 名称。
+工具使用当前 profile 的实时 Gateway/NapCat 连接，读取注册到 `napcat_qq_read`，发送注册到 `napcat_qq`。不建立第二条连接，不接受任意 OneBot action。
 
 ## 工具清单
 
-| 工具 | 用途 |
-| --- | --- |
-| `qq_send_message` | 发送文本、图片、@、QQ 表情及引用回复，支持多图和图文交错 |
-| `qq_send_media` | 发送单个图片、语音、视频或文件，可附说明、文件名和视频封面 |
-| `qq_send_forward` | 发送 QQ 合并转发卡片，混合自建多媒体节点与已有消息引用 |
-| `qq_get_message` | 读取已核验消息的文本、发送者、附件类型及可用短期图片引用，不返回附件 URL |
-| `qq_get_media` | 同会话按图片引用取图，返回本地路径/MIME/大小；需另用视觉工具读取，不直接调用视觉模型 |
-| `qq_get_chat_info` | 查询当前或获准目标会话的名称与类型 |
-| `qq_get_recent_messages` | 读取获准群的有界近期消息、发言人、时间、引用及历史状态；需要开启 `group_context` |
+| 工具 | 工具集 | 用途 |
+| --- | --- | --- |
+| `qq_send_message` | `napcat_qq` | 文本、图片、@、表情及引用，支持图文交错 |
+| `qq_send_media` | `napcat_qq` | 单个图片、语音、视频或文件，可附说明和视频封面 |
+| `qq_send_forward` | `napcat_qq` | 合并转发卡片，自建多媒体节点或已核验消息引用 |
+| `qq_get_message` | `napcat_qq_read` | 已核验消息的文字、作者、附件类型及有效引用 |
+| `qq_get_media` | `napcat_qq_read` | 同会话引用的受控缓存路径/MIME/大小和 `source` |
+| `qq_read_media` | `napcat_qq_read` | 通过 Hermes 已安装 handler 理解图片、语音、视频或文档 |
+| `qq_get_chat_info` | `napcat_qq_read` | 当前或获准目标会话的名称和类型 |
+| `qq_get_recent_messages` | `napcat_qq_read` | 有界私聊/群历史；群查询需要 `group_context` |
+| `qq_get_forward` | `napcat_qq_read` | 从已核验父消息展开有界合并转发，返回文本及引用 |
 
-这些工具只能在 NapCat 消息触发的实时 Gateway turn 中调用。CLI、TUI、其他平台会话及独立 cron 进程没有当前 QQ 身份，调用时会拒绝执行。Hermes 原有 `send_message` 和 cron 文本投递接口仍可按各自规则工作。
+这些模型工具只能在 NapCat 触发的实时 Gateway turn 中调用。CLI、TUI、其他平台会话及独立 cron 没有当前 QQ 身份，会拒绝执行。Hermes 的主机投递与独立正向 cron 文本/本地媒体接口按各自规则工作。
 
 ## 启用
 
@@ -31,35 +33,48 @@ uv run --no-project python scripts/install_plugin.py \
 
 ```yaml
 platform_toolsets:
-  napcat: [napcat_qq]
+  napcat: [napcat_qq_read]
 
 gateway:
   platforms:
     napcat:
       enabled: true
       extra:
-        group_toolsets: [napcat_qq]
+        group_toolsets: [napcat_qq_read]
         qq_tools:
-          enabled: true
+          enabled: false
+          read_enabled: true
           allow_cross_chat: false
         media:
+          references:
+            enabled: true
           outbound_roots:
             - /srv/qq-output
 ```
 
-多人群聊不需要 Agent 主动发图、文件或折叠消息时，保留 `group_toolsets: []`。`qq_tools.enabled` 与 Hermes 工具集授权都必须开启，缺少任意一项时模型无法调用这些动作。
+这是只读配置。需要发送时另加 `napcat_qq` 并设置 `qq_tools.enabled: true`。`read_enabled: true` 只允许读取；旧 `enabled: true` 允许两类调用，但 Hermes 仍必须授予对应工具集。升级前仅使用 `napcat_qq` 的会话要显式增加 `napcat_qq_read` 才能发现原来的 getter。Python 包与目录入口必须同时更新。
+
+不允许群成员调用模型工具时保持 `group_toolsets: []`，私聊授权不自动授予群聊。
 
 实际主动参与要求 `group_toolsets: []`，因此开启群工具时必须关闭 `proactive_assist` 或保持 `dry_run: true`。自动群背景注入不依赖模型调用工具，无工具模式仍可在被叫到时使用近期历史。
 
-## 读取近期群消息
+## 读取私聊和群历史
 
-`qq_get_recent_messages` 还要求 `group_context.enabled: true`。默认读取当前群；返回文字、稳定发言人 ID、时间、引用、附件类型和窗口状态，可包含短期图片引用，不返回媒体 URL，也不读取私人聊天历史。
+`qq_get_recent_messages` 默认读取当前会话，不返回媒体 URL。私聊调用 `get_friend_msg_history`，受 `qq_tools.history_limit`（默认 50）和 `history_window_seconds`（默认 1800）限制，逐条检查联系人、账号、作者、时间和撤回。机器人作者本身不能证明私聊目标。群查询需要 `group_context.enabled: true`，沿用其历史窗口和读预算。
 
 ```json
 {"limit": 30}
 ```
 
-`limit` 不得超过 `group_context.history_limit`；可传入 `before_message_id` 向前读取，但锚点必须来自当前群保留的已核验记录。分页仍受时间窗、返回量和读请求预算约束，不保证完整历史。跨群继续经过下述管理员及目标 ACL 检查。全部配置及数据保留边界见 [GROUP_CHAT](GROUP_CHAT.md)。
+`limit` 不得超过相应历史配置。`before_message_id` 必须来自同会话已核验消息；群锚点还须在保留记录内，文件通知的派生 ID 不能作分页锚点。结果可包含四种媒体的引用、过滤/截断状态；不保证完整离线历史。跨会话仍检查管理员及目标 ACL。群背景配置见 [GROUP_CHAT](GROUP_CHAT.md)。
+
+## 读取合并转发
+
+```json
+{"message_id":"包含合并转发的当前会话消息ID"}
+```
+
+这是 `qq_get_forward` 的参数，不能传任意 `forward_id`。插件先验证父消息同账号、同会话、作者可见、未撤回且在窗口内，再从其真实 forward 段取 ID。默认最多 3 层、50 个节点、50,000 UTF-8 文本字节，共享遍历预算并检测循环。节点作者是卡片内声称的 attribution，不成为授权主体；媒体权限和 TTL 绑定已核验父消息。结果中的 `truncated`、`unavailable`、`media_refs_truncated` 表示不完整展开，不是完整档案。
 
 ## 目标与权限
 
@@ -76,17 +91,25 @@ group:987654321
 - 当前发言用户位于 `admins`
 - 私聊目标通过用户白名单，或群目标位于 `allowed_groups`
 
-工具无法跨 profile 借用另一个 QQ 账号的 adapter。引用回复、读取消息及合并转发中的已有消息节点都要通过来源核验。群消息必须属于目标群；私聊消息必须来自目标联系人、是当前入站消息，或是当前进程记住的本机器人已发送消息。无法证明来源时，插件拒绝整次操作。
+工具无法跨 profile 借用另一账号的 adapter。引用、消息读取及已有消息转发都核验来源：群消息须属于目标群；私聊须来自目标联系人且无冲突 destination，或是机器人发给该联系人的消息。机器人消息缺 destination 时还须由本进程按目标记住。当前入站锚点不会覆盖冲突账号、作者或目标证据，无法证明来源就拒绝。
 
 ## 多媒体来源
 
-`source` 接受允许目录内的绝对本地路径、通过 `media.outbound` 策略检查的 HTTP(S) URL，显式 `base64://` / `data:<mime>;base64,` 输入，以及同会话 `media:<id>` 图片引用。插件先在 Hermes 侧检查媒体，不把任意 URL 直接交给 NapCat 下载。
+`source` 接受允许目录内的绝对本地路径、通过 `media.outbound` 策略检查的 HTTP(S) URL，显式 `base64://` / `data:<mime>;base64,` 输入，以及同会话 `media:<id>` 媒体引用。引用类型须匹配发送类型；语音引用的 `record` 对应 `qq_send_media` 的 `audio`。插件先在 Hermes 侧检查媒体，不把任意 URL 直接交给 NapCat 下载。
 
 已映射的本地文件直接用共享路径；其他已检查媒体可通过 `shared_cache_dir` 复制到专用共享暂存目录，未配置时使用受限 base64，超限时尝试 NapCat 分块上传。共享映射本身不提供挂载或跨主机同步。基础文档发送也支持该传输选择。出站公网模式、媒体大小与 WS 预算、共享暂存/配额的完整配置见 [MEDIA](MEDIA.md)。
 
 本地图片受 `media.max_bytes` 和文件头检查约束，同时受 `qq_tools.max_local_media_bytes`（默认 256 MiB）限制；其他本地媒体沿用工具大小上限。没有共享目录时，超过实际 inline/WS 预算的文件使用受限分块上传；关闭 streaming 后则拒绝超限文件。
 
-启用 `media.references.enabled` 后，当前图片注释、`qq_get_message` 或群上下文可能提供 `qqimg_...`。`qq_get_media` 参数为 `{"media_id":"qqimg_实际标识"}`，返回本地 `path`、MIME、字节数和 `source`，模型必须通过可用视觉工具消费该路径才能理解像素。自动引用/近期补图则使用正常 Hermes 媒体事件，详见媒体指南。
+启用 `media.references.enabled` 后，当前附件、消息/历史/合并转发读取或群上下文可提供媒体标识。`qq_get_media` 参数为 `{"media_id":"qqmedia_实际标识"}`，返回 Agent 可见的 `path`、MIME、字节数和 `source`，不自动理解内容。自动引用/近期补入使用正常 Hermes 媒体事件，详见 [媒体指南](MEDIA.md)。
+
+需要理解时调用：
+
+```json
+{"media_id":"qqmedia_实际标识","question":"附件说明了什么？"}
+```
+
+`qq_read_media` 通过 Hermes 注册的 `vision_analyze`（原生多模态或辅助视觉）、`video_analyze`、公共转录接口或 `read_file` 处理内容。语音尊重 runner STT 开关，只尝试已安装的本地 fallback。文档可传 `offset` 和 `limit`，默认 1/200、最多 500 行；普通字符串结果最多 16,000 字符，截断显式标记。缺失 handler、模型或依赖会明确失败。图片原生多模态结果保持 Hermes 原始 envelope，不转成普通 JSON 字符串。
 
 原样发回示例：
 
@@ -94,11 +117,11 @@ group:987654321
 {"media_type":"image","source":"media:qqimg_实际标识"}
 ```
 
-图片引用绑定当前账号与会话，有期限和撤回检查；一般跨会话发送即使已获管理员授权，也不允许跨聊天使用图片引用。缓存路径不因此加入 `outbound_roots`。重启、到期或淘汰后引用不可用；缓存失效后仅通过原文件标识/安全 URL 再取图。
+四种媒体引用都绑定当前账号与会话，有期限和撤回检查；管理员也不能跨聊天使用引用。缓存路径不因此加入 `outbound_roots`。重启、到期或淘汰后引用不可用；locator 恢复规则不延长期限。
 
 图片说明与图片放在同一条消息。QQ 客户端对语音、视频和文件混合正文的表现不一致，因此插件先发送媒体，再单独发送说明文字。媒体成功而说明失败时，工具返回 `partial: true` 和已知消息 ID；Agent 不应自动重试整个动作。
 
-插件不转码音视频。NapCat 与 QQ 客户端是否能播放某个编码格式，需要在部署环境验证。
+流式入站语音请求 NapCat 转换为 MP3，出站不提供通用音视频转码。真实编码、视觉和 STT 能力须在部署环境验证。
 
 ## 图文消息
 
@@ -138,6 +161,8 @@ group:987654321
 ```json
 {"message_id": "123456"}
 ```
+
+这类节点先核验同会话来源，再由 NapCat 服务端合并转发，可避免原媒体下载/重新上传。不开放原始单条转发 action；其受理但没有 message ID 的结果不能当作普通已完成发送。
 
 自建节点：
 
@@ -183,13 +208,19 @@ group:987654321
 ```yaml
 qq_tools:
   enabled: true
+  read_enabled: true
   allow_cross_chat: false
   max_segments: 64
   max_media_items: 8
   max_forward_nodes: 50
   max_forward_chars: 50000
+  max_forward_depth: 3
+  history_limit: 50
+  history_window_seconds: 1800
   max_local_media_bytes: 268435456
 ```
+
+`max_forward_chars` 在转发读取中计 UTF-8 文本字节，在自建发送节点中计文本字符；`max_forward_depth` 限制读取遍历。私聊历史使用这里的数量/时间窗，群历史使用 `group_context` 对应字段。
 
 相同 session、当前消息和参数的并发调用会共用同一个正在执行的 action，避免并行工具调度产生重复发送。操作完成后不保留幂等缓存，后续相同请求仍可再次发送。写入后超时或断线会返回 `delivery_uncertain: true`，此时应先检查 QQ 会话。
 

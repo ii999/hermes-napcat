@@ -1,6 +1,6 @@
 # NapCat 流式上传与 base64 直发
 
-2026-09-30，延续 PR #3 的媒体策略与图片引用实现。此扩展复用已有正向/反向 OneBot WebSocket，不开第二个 HTTP 服务，不把任意远程 URL 交给 NapCat 下载，也不开放任意远端文件路径。
+上传复用已有正向/反向 OneBot WebSocket，不开第二个 HTTP 服务，不把任意远程 URL 交给 NapCat 下载，也不开放任意远端文件路径。认证入站下载和内容理解见 [MEDIA](MEDIA.md)；下文 `media.streaming` 只控制出站上传。
 
 ## 默认值与迁移
 
@@ -9,7 +9,7 @@
 | `media.max_bytes` | 32 MiB | 单项网络下载、本地图片和解码后的 inline 输入上限 |
 | `media.inline_max_bytes` | 10 MiB | 可以直接装入一次发送请求的原始媒体字节上限 |
 | `ws_max_bytes` | 16 MiB | 单次收/发 WebSocket 消息上限，包含 base64 和 UTF-8 JSON |
-| `media.timeout` | 60 秒 | HTTP 媒体下载超时 |
+| `media.timeout` | 60 秒 | 入站 WS/HTTP 媒体下载超时 |
 | `media.streaming.max_bytes` | 256 MiB | 单项分块上传上限，同时受本地媒体/图片各自上限约束 |
 | `media.streaming.chunk_bytes` | 256 KiB | 每块原始字节数；按实际 WS 预算自动减小 |
 | `media.streaming.max_concurrent` | 1 | 同时上传数，避免 NapCat 合并阶段过高内存占用 |
@@ -24,13 +24,13 @@
 
 ## 传输选择
 
-URL、本地文件、受控图片引用和显式 base64 输入进入相同的权限/类型/大小检查。已映射文件优先使用共享路径，有 `shared_cache_dir` 时优先暂存到共享卷。没有共享暂存时，小文件使用 base64，超过实际 inline/WS 预算的文件通过 `upload_file_stream` 上传，再用当前连接返回的受控 NapCat 路径发送。
+URL、本地文件、受控媒体引用和显式 base64 输入进入相同的权限/类型/大小检查。已映射文件优先使用共享路径，有 `shared_cache_dir` 时优先暂存到共享卷。没有共享暂存时，小文件使用 base64，超过实际 inline/WS 预算的文件通过 `upload_file_stream` 上传，再用当前连接返回的受控 NapCat 路径发送。
 
 已有的 base64 小图无需落盘或整图重新编码：插件分块解码校验、检查图片文件头和 data URI 的 MIME，然后直接使用已验证的 base64 发送。较大的 base64 或需要共享暂存的输入会先解码到受配额约束的缓存，再走共享或流式路径。
 
 普通图文多图消息继续按段保序拆分。合并转发卡片仍是一次发送，不自动拆卡；可通过 `streaming.mode: always` 将非共享媒体预先分块上传，使卡片内只携带短路径。不会在 QQ 消息发送失败后偷偷换传输方式重发。
 
-基础 Gateway 的 `send_document` 也使用统一媒体发送路径，现在无共享卷时可直接使用 base64/流式传输。独立 cron sender 的媒体契约仍未实现。
+Gateway 的 `send_document` 和独立正向 cron 组合投递使用同一媒体准备路径，无共享卷时可用 base64/流式传输。cron 接收 Hermes 的本地路径/voice 标志，`force_document` 将所有媒体按文件发送，并在首条消息前预检全部输入。反向独立 sender 仍不支持。
 
 ## 配置
 

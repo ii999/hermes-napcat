@@ -2,7 +2,9 @@
 
 ## 模块职责
 
-`config.py` 校验配置并隐藏错误输入中的密钥；`protocol.py` 负责 OneBot 消息段、目标和标识符；`policy.py` 负责白名单、触发、限流和有界去重；`transport.py` 负责正反向 WebSocket、账号校验和 action/echo；`media.py` 负责分方向安全下载、base64 校验与共享暂存，`stream_upload.py` 负责有界分块上传、哈希校验及连接绑定；`media_refs.py` 保存有界图片引用，`media_adapter.py` 统一适配器媒体读取/传输边界；`adapter.py` 构造 Hermes 事件并执行受控 QQ 动作；`tools.py` 绑定当前 session 并校验基础工具参数；`plugin.py` 注册平台和主机驱动投递钩子；`cli.py` 提供人工诊断。
+`config.py` 校验配置；`protocol.py` 负责消息段、目标和标识符；`policy.py` 负责白名单、触发、限流和去重；`transport.py` 负责认证 WebSocket、普通 action/echo 和有界多响应流。`stream_download.py` 验证固定 NapCat 下载协议，`media.py` 负责字节、配额、原子缓存、HTTP 安全与共享暂存，`stream_upload.py` 负责上传完整性和连接绑定。`media_refs.py` 保存四类媒体的来源/期限，`media_adapter.py` 统一读取/发送边界，`history.py` 负责私聊历史与父消息绑定的合并转发，`file_notices.py` 规范化文件通知并有界去重。
+
+`adapter.py` 构造 Hermes 事件及受控动作；`media_understanding.py` 在主机边界调用已安装的 Hermes handler；`tools.py`/`group_tools.py` 绑定当前 session 和读写工具；`outbound.py` 预检主机组合投递；`plugin.py` 注册平台/投递钩子；`cli.py` 提供诊断。协议、存储、流式传输和历史模块不导入 Hermes。
 
 可选群聊层由 `group_adapter.py` 扩展基础适配器。`context.py` 保存有界观察记录，`group_chat.py` 负责观察、回填和调度，`engagement.py` 负责规则/无工具模型参与判断，`group_tools.py` 注册基础工具及近期群消息读取工具。后四个模块中的协议和调度逻辑不导入 Hermes；只有适配器和工具执行边界使用主机接口。
 
@@ -10,7 +12,7 @@
 
 ## 入站与鉴权
 
-OneBot reader 先区分事件和 API 响应。建立连接后调用 `get_login_info`，核对预期机器人账号。账号确认前只临时缓存有界消息，错误账号不进入事件处理。响应在 reader 内按 echo 完成 Future，事件进入单独 worker，因而事件处理中调用 `get_msg` 等 API 不会阻塞响应 reader。
+OneBot reader 先区分事件和 API 响应。连接后调用 `get_login_info` 核对账号；确认前仅缓存有界事件。普通 echo 完成 Future，多响应下载 echo 进入专用有界队列；饱和只使该流失败，不阻塞普通 action 或事件 worker。文件通知进入正常事件通道，撤回有独立有界通道。事件 handler 可调用 `get_msg` 等 action。
 
 基础模式下，worker 按聊天键顺序进入 adapter，跨聊天最多并行 event_workers 个。插件先检查账号、用户、群；再处理去重、限流和触发。群回复触发仅接受本进程记得的机器人消息，或通过 `get_msg` 验证同一群、机器人作者的消息。模型或用户提供的 quote sender 字段不能作为授权依据。
 
@@ -34,29 +36,29 @@ Hermes 的 `handle_message()` 只完成入队。适配器通过 `on_processing_s
 
 发送目标先经 `private:<QQ>` / `group:<ID>` 解析和 ACL 校验，模型回复作为纯 text 消息段。引用使用独立 reply 段。分段过程保持文本内容并限制每段长度，只有第一段带引用。每次 OneBot action 使用新 echo；成功必须收到 `status=ok` 且整数 `retcode=0`。
 
-`status=async` 是受理，不表示完成。连接断开、写后超时或缺失 message_id 表示结果不确定，禁止自动重发。多段发送在中途失败后返回已知成功消息 ID。读操作和写操作采用同一种保守失败策略，没有隐藏重试队列。
+`status=async` 是受理，不表示完成。发送断开、写后超时或缺失 message_id 表示结果不确定，禁止自动重发。多段发送失败保留已知 ID。只读下载有独立断线/超时错误，不混用发送的不确定回执；仅明确不支持或文件 unavailable 可采用文档规定的 locator 刷新/安全回退，没有隐藏发送重试队列。
 
 默认发送间隔 0.4 秒只是本地限速，不承诺满足 QQ 的风控规则。文件上传和正文分属不同 action，文件成功但说明文字失败会返回部分结果。超出 inline 大小的媒体使用共享路径或 NapCat 分块上传，接口不可用时返回明确错误。文本、媒体和上游动作均不能保证最终用户已读。
 
 ## 会话、工具与定时推送
 
-插件注册 Hermes 的 `parse_target_ref_fn`、`validate_target_ref_fn`、`cron_deliver_env_var` 和 `standalone_sender_fn`，由主机驱动发送。独立 sender 建立只发不处理事件的正向连接，结束后关闭资源。反向模式需要已经运行的 Gateway，独立 sender 返回明确错误。
+插件注册 Hermes 的目标解析、校验、默认投递环境变量和 standalone sender。独立 sender 建立只发的正向连接，接收文本及 `(local_path, is_voice)` 媒体列表，复用 `prepare_media`/`send_prepared_media`。全部路径、大小和引用在首条消息前预检；`force_document` 覆盖分类。完成后关闭资源，反向独立 sender 明确拒绝。
 
-`napcat_qq` 暴露七个有界工具，包括 `qq_get_recent_messages` 和需要图片引用开启的 `qq_get_media`，不提供任意 OneBot action 透传。handler 从 Hermes `gateway.session_context` 读取当前 platform、chat、user、profile 和 message ID，再从正在运行的 Gateway 解析该 profile 自己的 adapter。非 NapCat turn、无实时 Gateway 或 profile 没有 adapter 时均失败关闭。
+发送工具属于 `napcat_qq`，getter、近期历史、`qq_get_forward` 和 `qq_read_media` 属于 `napcat_qq_read`。读开关不授予发送。handler 从 Hermes task-local session context 读取 platform/chat/user/profile/message，再解析该 profile 的实时 adapter。非 NapCat turn、无 Gateway 或无 adapter 均失败关闭。`qq_read_media` 下载在 Gateway loop，分析在调用者主机上下文执行；公共 registry handler 选择 native/aux vision，原生多模态结果保持原样。
 
-工具目标默认固定为当前会话。跨会话需要配置显式开启、当前用户属于 `admins`、目标通过 adapter 白名单三项条件。群消息引用通过 `group_id` 核验；私聊引用只接受目标联系人发来的消息、当前入站消息，或本进程按目标记住的机器人消息。读取工具只返回有界文本、发送者和附件类型，不返回媒体 URL 或原始事件；近期消息工具另返回时间、引用及窗口状态；图片引用开启后可返回 `media_id`，专用取图工具返回受控本地路径，不直接调用视觉模型。
+工具目标默认当前会话。一般跨会话需要显式开关、管理员和目标白名单；媒体引用仍只能同会话使用。群消息验证群归属；私聊验证联系人/目标证据。读取输出有界文本、作者、时间、类型、有效媒体 ID，不返回 URL/原始事件。私聊历史逐条检查窗口/撤回，群历史沿用观察控制器。合并转发从已核验父消息取 ID，遍历共享深度/节点/字节预算，声称的节点作者不能授予权限。
 
 模型提供的媒体 URL 先走 `MediaStore`，不会直接交给 NapCat 下载。本地路径仍受 `outbound_roots`、真实路径解析、工具字节上限和共享路径映射约束。合并转发先核验全部已有消息节点，再下载自建节点媒体，最后执行一次发送，避免验证中途产生不可逆动作。自建节点使用机器人 QQ 号，模型只能设置显示标签。
 
-相同 session、当前消息和参数的并发工具调用在 adapter 的 Gateway loop 上共用一个 in-flight Task。Task 完成后立即移除，不形成长期幂等缓存。调用方取消后，已经调度的发送继续得到结果，避免上层把取消误判为“未执行”并自动重发。媒体正文分开发送时，后半段失败会返回部分成功状态。
+相同 session、当前消息和参数的并发发送工具调用在 adapter 的 Gateway loop 上共用一个 in-flight Task。Task 完成后立即移除，不形成长期幂等缓存。调用方取消后，已经调度的发送继续得到结果，避免上层把取消误判为“未执行”并自动重发。读取工具直接执行，取消会传播到 Gateway loop 的下载任务，清理未完成文件并释放缓存额度。媒体正文分开发送时，后半段失败会返回部分成功状态。
 
 ## 网络、媒体和存储
 
-媒体 HTTP 下载与 OneBot API HTTP 是不同链路：OneBot 的收发始终走 WS；必要的附件字节通过受控 HTTP(s) 下载。下载时不转发 WS token，不使用网络代理环境变量，每跳校验地址和实际解析 IP。不读取入站本地路径。两方向使用独立 URL 策略与 HTTP session，旧配置按方向回退继承。图片 URL 失败最多查询一次 `get_image` 刷新，再走入站安全下载器。
+OneBot action 始终走 WS，入站附件默认也通过该认证连接下载。下载器验证 info/chunk/complete、规范 base64、块序/实际字节/完成总数，绑定 epoch；存储只在完整结束后发布 0600 UUID 文件。`auto` 仅按明确能力/locator 失败使用受控 HTTP；`stream` 不回退，`http` 是显式兼容模式。HTTP 两方向独立校验实际 DNS/重定向/origin，不转发 WS token、不读取入站本地路径。普通失效文件标识只从核验的原消息刷新一次。
 
-缓存只删除符合插件 UUID 命名规则且过期的常规文件，保留其他文件。额度不足时拒绝新下载，不删除新近附件；缓存 TTL 必须大于预计 Agent 任务时长。缓存不提供跨进程严格总配额，因此不同实例应使用不同 profile 目录。
+缓存位于 Hermes profile 标准 document cache 的 `napcat` 子目录，并通过主机路径映射交给 sandbox 文件工具。只清理自身 UUID 过期常规文件，额度不足拒绝新下载；TTL 须覆盖任务时长。挂载/同步和跨进程总配额不由插件保证，不同实例应使用独立 profile。
 
-本地、URL 下载和引用图片共用传输选择：直接共享映射、专用共享暂存、受限 base64、NapCat 分块上传。下载及暂存共同计入本实例缓存预算，临时复制会占用两份空间。普通多图消息按整条请求预算预检后保序拆分，合并转发卡片保持原子动作。图片引用在读取、下载完成及发送锁内复核会话/身份/有效期/撤回。
+本地、URL 和四种媒体引用共用共享/暂存/inline/stream 发送准备，下载及暂存共同计入额度。当前附件先占本轮预算，随后明确引用；近期仅在无当前/无引用时补入。失败下载消耗完整 allowance。引用在读取、事件构造、分析返回及发送锁内复核来源、期限和撤回。已有消息合并转发走 NapCat 服务端，无需材料化原媒体。
 
 共享路径映射对应同一存储内容在 Hermes 和 NapCat 中的两条路径。管理员负责挂载，NapCat 只读。Windows 远端路径允许盘符路径；在 Linux 本机测试中只核验了路径字符串映射，未运行 Windows QQ。
 

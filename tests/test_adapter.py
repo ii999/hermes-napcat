@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+import time
 
 import pytest
 
 from hermes_napcat.media import MediaStore
 from hermes_napcat.plugin import register
 from hermes_napcat.transport import DeliveryUncertain
+from hermes_napcat.protocol import Target
 from test_media import PNG
 
 
@@ -145,8 +147,44 @@ def test_plugin_registration_exposes_gateway_hooks_and_qq_tools(hermes_doubles):
     assert captured["allow_update_command"] is False
     assert callable(captured["standalone_sender_fn"])
     assert captured["parse_target_ref_fn"]("private:200") == ("private:200", None)
-    assert {item["name"] for item in registered_tools} == {
-        "qq_send_message", "qq_send_media", "qq_send_forward", "qq_get_message",
-        "qq_get_chat_info", "qq_get_recent_messages", "qq_get_media",
-    }
-    assert all(item["toolset"] == "napcat_qq" for item in registered_tools)
+    by_name = {item["name"]: item for item in registered_tools}
+    assert by_name["qq_send_message"]["toolset"] == "napcat_qq"
+    assert by_name["qq_read_media"]["toolset"] == "napcat_qq_read"
+    assert all(item["toolset"] == "napcat_qq_read" for name, item in by_name.items()
+               if name.startswith("qq_get_"))
+
+
+async def test_private_file_notice_requires_acl_and_never_becomes_get_msg_id(hermes_doubles, settings):
+    adapter = make_adapter(hermes_doubles, settings, media={"references": {"enabled": True}})
+    adapter._attachments = AsyncMock(return_value=([], [], []))
+    notice = {"post_type": "notice", "notice_type": "offline_file", "self_id": 100,
+              "user_id": 999, "time": time.time(),
+              "file": {"id": "opaque-file", "name": "report.pdf", "size": 100}}
+    await adapter._receive(notice)
+    adapter._attachments.assert_not_called()
+    notice["user_id"] = 200
+    await adapter._receive(notice)
+    await adapter._receive(notice)
+    adapter.handle_message.assert_awaited_once()
+    incoming = adapter._attachments.await_args.args[0]
+    assert incoming.raw["_napcat_file_notice"] and incoming.segments[0]["type"] == "file"
+    with pytest.raises(PermissionError, match="file notices"):
+        await adapter.verified_message(incoming.target, incoming.message_id)
+    adapter.transport.call.assert_not_called()
+
+
+@pytest.mark.parametrize("changes", [
+    {"self_id": 999}, {"message_id": 12},
+    {"user_id": 201, "target_id": 100},
+    {"user_id": 100, "target_id": 201},
+    {"sender": {"user_id": 201}},
+])
+async def test_verified_private_message_rejects_conflicting_identity_even_at_current_anchor(
+    hermes_doubles, settings, changes,
+):
+    adapter = make_adapter(hermes_doubles, settings)
+    adapter.policy.own.add(("private:200", "11"))
+    adapter.transport.call.return_value = {
+        "message_type": "private", "user_id": 200, "message_id": 11, **changes}
+    with pytest.raises(PermissionError):
+        await adapter.verified_message(Target.parse("private:200"), "11", current_message_id="11")

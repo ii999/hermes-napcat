@@ -8,7 +8,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .media import Downloaded, InlineTooLarge, MediaError, inline_info, is_inline_source
-from .media_refs import ReferencedMedia, image_file_id
+from .media_refs import MEDIA_KINDS, MediaReference, ReferencedMedia, media_file_id, media_url
 from .protocol import Incoming, Target, message_id
 from .transport import OneBotError
 from .stream_upload import StreamedMedia, StreamUploader
@@ -33,184 +33,306 @@ class MediaAdapterMixin:
                 pass
         return True
 
-    def _can_read_image_author(self, target: Target, author: str) -> bool:
+    def _can_read_media_author(self, target: Target, author: str) -> bool:
         return self.policy.can_send(target) and (
             author == self.settings.self_id or self.policy.authorized_user(author)
             or (target.kind == "group" and self.settings.group_context.enabled
                 and self.settings.group_context.observe_all_members))
 
-    def remember_verified_images(self, target: Target, identifier: str, data: dict):
+    def _verified_media_incoming(self, target: Target, identifier: str,
+                                 data: dict[str, Any]) -> Incoming | None:
         """The caller must first verify the message's conversation through get_msg."""
         if not self.settings.media.enabled or not self.settings.media.references.enabled:
-            return ()
+            return None
         if data.get("self_id") is not None and str(data["self_id"]) != self.settings.self_id:
-            return ()
+            return None
         try:
             if data.get("message_id") is not None and message_id(data["message_id"]) != identifier:
-                return ()
+                return None
         except ValueError:
-            return ()
+            return None
         if data.get("message_type") != target.kind:
-            return ()
+            return None
         sender = data.get("sender") if isinstance(data.get("sender"), dict) else {}
         author = str(data.get("user_id") or sender.get("user_id") or "")
-        if not self._can_read_image_author(target, author) or "time" not in data:
-            return ()
+        if not self._can_read_media_author(target, author) or "time" not in data:
+            return None
         if sender.get("user_id") is not None and str(sender["user_id"]) != author:
-            return ()
+            return None
         if target.kind == "group":
             if str(data.get("group_id")) != target.id:
-                return ()
+                return None
         else:
             destination = str(data.get("target_id") or "")
             if author == target.id:
                 if destination not in ("", target.id, self.settings.self_id):
-                    return ()
+                    return None
             elif author != self.settings.self_id or not (
-                destination == target.id or self.policy.own.contains((target.address, identifier))
+                destination == target.id
+                or (not destination and self.policy.own.contains((target.address, identifier)))
             ):
-                return ()
+                return None
         try:
             incoming = Incoming.parse({**data, "post_type": "message",
                                        "self_id": self.settings.self_id,
                                        "user_id": author, "message_id": identifier})
         except (ValueError, TypeError):
-            return ()
+            return None
         if incoming is None:
-            return ()
-        return self.media_refs.remember(replace(incoming, target=target))
+            return None
+        return replace(incoming, target=target)
 
-    def _image_access(self, identifier: str, target: Target, requester_id: str):
+    def remember_verified_media(self, target: Target, identifier: str,
+                                data: dict[str, Any]) -> tuple[MediaReference, ...]:
+        incoming = self._verified_media_incoming(target, identifier, data)
+        return self.media_refs.remember(incoming) if incoming is not None else ()
+
+    def remember_forward_media(self, target: Target, parent_id: str,
+                               parent_data: dict[str, Any], node_path: tuple[int, ...],
+                               node_data: dict[str, Any]) -> tuple[MediaReference, ...]:
+        """Bind verified forward-node locators to the enclosing message's author and lifetime."""
+        incoming = self._verified_media_incoming(target, parent_id, parent_data)
+        if incoming is None or not node_path:
+            return ()
+        content = node_data.get("content", node_data.get("message"))
+        if not isinstance(content, list):
+            return ()
+        try:
+            node = Incoming.parse({**incoming.raw, "post_type": "message",
+                                   "self_id": incoming.self_id, "user_id": incoming.user_id,
+                                   "sender": {"user_id": incoming.user_id},
+                                   "message_id": incoming.message_id, "message": content})
+        except (ValueError, TypeError):
+            return ()
+        return self.media_refs.remember(replace(node, target=target), node_path=node_path) if node else ()
+
+    def _media_access(self, identifier: str, target: Target, requester_id: str, *, kind: str | None = None):
         if (not self.settings.media.enabled or not self.policy.authorized_user(requester_id)
                 or not self.policy.can_send(target)):
             raise PermissionError("current user or conversation cannot access media")
         item = self.media_refs.get(identifier, target)
-        if not self._can_read_image_author(target, item.user_id):
-            raise PermissionError("image author is outside the observation policy")
+        if not self._can_read_media_author(target, item.user_id):
+            raise PermissionError("media author is outside the observation policy")
+        if kind is not None and item.kind != kind:
+            raise MediaError("media reference kind does not match the requested segment")
         return item
 
-    async def _download_image(self, data: dict[str, Any]) -> Downloaded:
+    async def _download_http(self, *, kind: str, file_id: str | None, url: str | None,
+                             access_check, max_bytes: int | None = None) -> Downloaded:
         if self.media is None:
             raise MediaError("media store is not ready")
-        url = data.get("url")
-        error = None
-        if isinstance(url, str) and url:
-            try:
-                return await self.media.download(url, kind="image")
-            except MediaError as exc:
-                error = exc
-        file_id = image_file_id(data.get("file"))
-        if file_id is not None:
-            try:
-                info = await self.transport.call("get_image", {"file": file_id})
-            except OneBotError as exc:
-                raise MediaError("image URL refresh failed") from exc
-            refreshed = info.get("url") if isinstance(info, dict) else None
-            if isinstance(refreshed, str) and refreshed:
-                # Exactly one refresh; even its redirects use the inbound safe downloader.
-                return await self.media.download(refreshed, kind="image")
-        if error is not None:
-            raise error
-        # A NapCat path is on another machine, and must never become a Hermes file read.
-        raise MediaError("image has no usable URL or refreshable file identifier")
+        access_check()
+        if url is None and kind == "image" and file_id is not None:
+            info = await self.transport.call("get_image", {"file": file_id})
+            access_check()
+            url = media_url(info.get("url")) if isinstance(info, dict) else None
+        if url is None:
+            raise MediaError("media has no safe HTTP locator")
+        result = await self.media.download(url, kind=kind, max_bytes=max_bytes)
+        access_check()
+        return result
 
-    async def resolve_media(self, identifier: str, target: Target, requester_id: str) -> Downloaded:
-        self._image_access(identifier, target, requester_id)
+    async def _download_media(self, *, kind: str, file_id: str | None, url: str | None,
+                              access_check, max_bytes: int | None = None) -> Downloaded:
+        from .stream_download import StreamDownloader, StreamDownloadUnsupported
+
+        if self.media is None:
+            raise MediaError("media store is not ready")
+        mode = self.settings.media.download_mode
+        if mode == "http":
+            return await self._download_http(kind=kind, file_id=file_id, url=url,
+                                             access_check=access_check, max_bytes=max_bytes)
+        if file_id is not None:
+            downloader = getattr(self, "_stream_downloader", None)
+            if downloader is None:
+                downloader = self._stream_downloader = StreamDownloader(
+                    self.transport, self.settings, self.media)
+            try:
+                return await downloader.download(file_id, kind=kind, access_check=access_check,
+                                                 max_bytes=max_bytes)
+            except StreamDownloadUnsupported:
+                if mode == "stream":
+                    raise
+                log.warning("NapCat media stream action is unsupported; using safe HTTP resolution")
+        elif mode == "stream":
+            raise MediaError("stream download requires a safe opaque file identifier")
+        else:
+            log.warning("Media has no safe opaque file identifier; using its safe HTTP locator")
+        return await self._download_http(kind=kind, file_id=file_id, url=url,
+                                         access_check=access_check, max_bytes=max_bytes)
+
+    async def _refresh_media(self, item: MediaReference, target: Target, requester_id: str):
+        if item.node_path or item.notice_only:
+            raise MediaError("media locator is stale; refresh the verified forward or file history")
+        data = await self.verified_message(target, item.message_id)
+        self._media_access(item.media_id, target, requester_id)
+        sender = data.get("sender") if isinstance(data.get("sender"), dict) else {}
+        author = str(data.get("user_id") or sender.get("user_id") or "")
+        if author != item.user_id:
+            raise PermissionError("refreshed media author does not match the original message")
+        refs = self.remember_verified_media(target, item.message_id, data)
+        updated = next((ref for ref in refs if ref.media_id == item.media_id), None)
+        if updated is None or updated.kind != item.kind:
+            raise MediaError("refreshed message does not contain the referenced attachment")
+        return self._media_access(item.media_id, target, requester_id, kind=item.kind)
+
+    async def resolve_media(self, identifier: str, target: Target, requester_id: str, *,
+                            max_bytes: int | None = None) -> Downloaded:
+        from .stream_download import StreamFileUnavailable
+
+        if max_bytes is not None and (type(max_bytes) is not int or max_bytes <= 0):
+            raise MediaError("media byte budget must be a positive integer")
+        self._media_access(identifier, target, requester_id)
         async with self._media_read_gate:
-            item = self._image_access(identifier, target, requester_id)
+            item = self._media_access(identifier, target, requester_id)
             if self.media is None:
                 raise MediaError("media store is not ready")
             if item.downloaded is not None:
                 try:
                     self.media.validate_cached(item.downloaded)
-                    return item.downloaded
                 except (MediaError, OSError):
-                    pass  # Re-fetch an evicted or changed cache object through the same policy.
-            downloaded = await self._download_image({"url": item.url, "file": item.file_id})
-            self._image_access(identifier, target, requester_id)
+                    pass
+                else:
+                    if max_bytes is not None and item.downloaded.size > max_bytes:
+                        raise MediaError("media exceeds remaining turn byte budget")
+                    return item.downloaded
+            def access_check():
+                return self._media_access(identifier, target, requester_id, kind=item.kind)
+
+            try:
+                downloaded = await self._download_media(
+                    kind=item.kind, file_id=item.file_id, url=item.url,
+                    access_check=access_check, max_bytes=max_bytes)
+            except MediaError as exc:
+                stale_http = (self.settings.media.download_mode in ("auto", "http") and str(exc) in (
+                    "media server returned HTTP 403", "media server returned HTTP 404",
+                    "media server returned HTTP 410"))
+                if not isinstance(exc, StreamFileUnavailable) and not stale_http:
+                    raise
+                updated = await self._refresh_media(item, target, requester_id)
+                try:
+                    downloaded = await self._download_media(
+                        kind=updated.kind, file_id=updated.file_id, url=updated.url,
+                        access_check=access_check, max_bytes=max_bytes)
+                except StreamFileUnavailable:
+                    if self.settings.media.download_mode != "auto":
+                        raise
+                    log.warning("NapCat cannot resolve the refreshed media ID; using safe HTTP resolution")
+                    downloaded = await self._download_http(
+                        kind=updated.kind, file_id=updated.file_id, url=updated.url,
+                        access_check=access_check, max_bytes=max_bytes)
+            access_check()
+            if max_bytes is not None and downloaded.size > max_bytes:
+                raise MediaError("media exceeds remaining turn byte budget")
             self.media_refs.set_downloaded(identifier, target, downloaded)
             return downloaded
 
     async def _attachments(self, incoming: Incoming):
-        parts = [p for p in incoming.segments if p["type"] in ("image", "record", "video", "file")]
+        parts = [part for part in incoming.segments if part["type"] in MEDIA_KINDS]
         config = self.settings.media
         if self.media_refs.is_recalled(incoming.target.address, incoming.message_id):
-            return [], [], ["[当前图片消息已撤回，未读取其内容]"]
+            return [], [], ["[当前附件消息已撤回，未读取其内容]"]
         if not config.enabled:
             return [], [], ["[已关闭附件下载，本次未读取附件内容]"] if parts else []
         refs = self.media_refs.remember(incoming)
-        by_index = {ref.image_index: ref for ref in refs}
-        received: list[tuple[Downloaded, str | None]] = []
+        by_index = {ref.attachment_index: ref for ref in refs}
         notices: list[str] = []
-        image_index = 0
-        for part in parts[:config.max_attachments]:
-            kind, data = part["type"], part["data"]
-            ref = by_index.get(image_index) if kind == "image" else None
-            if kind == "image":
-                image_index += 1
+        received: list[tuple[Downloaded, Any]] = []
+        remaining = config.max_turn_bytes
+        attempted = 0
+        limited = False
+
+        def exhausted() -> bool:
+            return attempted >= config.max_attachments or remaining <= 0
+
+        def current_access():
+            if (not self.policy.authorized_user(incoming.user_id)
+                    or not self._can_read_media_author(incoming.target, incoming.user_id)):
+                raise PermissionError("current user or conversation cannot access media")
+            if self.media_refs.is_recalled(incoming.target.address, incoming.message_id):
+                raise MediaError("current attachment message was recalled")
+
+        async def attach(*, kind: str, ref=None, data=None):
+            nonlocal remaining, attempted
+            allowance = min(config.max_bytes, remaining)
+            attempted += 1
+            remaining -= allowance
             try:
-                if self.media is None:
-                    raise MediaError("media store is not ready")
                 if ref is not None:
-                    downloaded = await self.resolve_media(ref.media_id, incoming.target, incoming.user_id)
-                elif kind == "image":
-                    downloaded = await self._download_image(data)
-                elif not data.get("url"):
-                    raise MediaError("attachment has no accessible URL")
+                    downloaded = await self.resolve_media(
+                        ref.media_id, incoming.target, incoming.user_id, max_bytes=allowance)
+                elif data is not None and not config.references.enabled:
+                    downloaded = await self._download_media(
+                        kind=kind, file_id=media_file_id(data.get("file_id")) or media_file_id(data.get("file")),
+                        url=media_url(data.get("url")), access_check=current_access, max_bytes=allowance)
                 else:
-                    downloaded = await self.media.download(data["url"], kind=kind)
-                received.append((downloaded, ref.media_id if ref is not None else None))
+                    raise MediaError("attachment has no usable reference")
+                if downloaded.size > allowance:
+                    raise MediaError("media exceeds remaining turn byte budget")
+                received.append((downloaded, ref))
+                remaining += allowance - downloaded.size
             except (MediaError, OneBotError, PermissionError, OSError) as exc:
                 log.warning("Inbound media rejected (%s)", type(exc).__name__)
                 notices.append(f"[{kind} 附件未读取：下载失败或安全/大小限制]")
-        if len(parts) > config.max_attachments:
-            notices.append("[附件数量超过本次处理上限，其余附件未读取]")
+                # A failed transfer may already have read its whole allowance.
+                # Keep that reservation rather than guessing how many bytes arrived.
 
-        # No automatic semantic guessing: quotes take precedence; recent fallback is explicit,
-        # bounded by time and restricted to the current speaker's own images.
+        for index, part in enumerate(parts):
+            if exhausted():
+                limited = True
+                break
+            await attach(kind=part["type"], ref=by_index.get(index), data=part["data"])
+
         extra = ()
-        if config.references.enabled and not parts:
+        if config.references.enabled:
             if incoming.reply_to and config.references.attach_quoted:
                 if self.media_refs.is_recalled(incoming.target.address, incoming.reply_to):
-                    notices.append("[引用图片已撤回，未读取其内容]")
-                extra = self.media_refs.for_message(incoming.target, incoming.reply_to)
-                if not extra and not self.media_refs.is_recalled(incoming.target.address, incoming.reply_to):
-                    try:
-                        data = await self.verified_message(incoming.target, incoming.reply_to)
-                        extra = self.remember_verified_images(incoming.target, incoming.reply_to, data)
-                        segments = data.get("message")
-                        if not extra and isinstance(segments, list) and any(
-                            p.get("type") == "image" for p in segments if isinstance(p, dict)
-                        ):
-                            notices.append("[引用图片已过期或不可见，未读取其内容]")
-                    except (OneBotError, ValueError, PermissionError):
-                        notices.append("[引用图片不可用，未读取其内容]")
-            elif config.references.attach_recent:
+                    notices.append("[引用附件已撤回，未读取其内容]")
+                else:
+                    extra = self.media_refs.for_message(incoming.target, incoming.reply_to)
+                    if not extra and not exhausted():
+                        try:
+                            data = await self.verified_message(incoming.target, incoming.reply_to)
+                            extra = self.remember_verified_media(incoming.target, incoming.reply_to, data)
+                            segments = data.get("message")
+                            if not extra and isinstance(segments, list) and any(
+                                p.get("type") in MEDIA_KINDS for p in segments if isinstance(p, dict)
+                            ):
+                                notices.append("[引用附件已过期或不可见，未读取其内容]")
+                        except (OneBotError, ValueError, PermissionError):
+                            notices.append("[引用附件不可用，未读取其内容]")
+            elif not incoming.reply_to and not parts and config.references.attach_recent:
                 extra = self.media_refs.recent(incoming)
-        for ref in extra[:max(0, config.max_attachments - len(received))]:
-            try:
-                downloaded = await self.resolve_media(ref.media_id, incoming.target, incoming.user_id)
-                received.append((downloaded, ref.media_id))
-            except (MediaError, OneBotError, PermissionError, OSError):
-                notices.append("[历史图片不可用、已过期或已撤回，未读取其内容]")
+        current_ids = {ref.media_id for ref in refs}
+        for ref in extra:
+            if ref.media_id not in current_ids:
+                if exhausted():
+                    limited = True
+                    break
+                await attach(kind=ref.kind, ref=ref)
+        if limited:
+            notices.append("[附件数量或总字节数超过本次处理上限，其余附件未读取]")
         if self.media_refs.is_recalled(incoming.target.address, incoming.message_id):
-            return [], [], ["[当前图片消息已撤回，未传入模型]"]
+            return [], [], ["[当前附件消息已撤回，未传入模型]"]
         paths, mimes = [], []
-        for downloaded, identifier in received:
-            if identifier is not None:
+        for downloaded, ref in received:
+            if ref is not None:
                 try:
-                    ref = self._image_access(identifier, incoming.target, incoming.user_id)
+                    ref = self._media_access(ref.media_id, incoming.target, incoming.user_id, kind=ref.kind)
                 except (MediaError, PermissionError):
-                    notices.append("[图片引用已失效，本次未传入模型]")
+                    notices.append("[附件引用已失效，本次未传入模型]")
                     continue
                 notices.append(
-                    f"[图片 {len(paths) + 1}: media:{identifier}; "
-                    f"message_id={ref.message_id}; sender_id={ref.user_id}; index={ref.image_index}]")
+                    f"[{ref.kind} 附件 {len(paths) + 1}: media:{ref.media_id}; "
+                    f"message_id={ref.message_id}; sender_id={ref.user_id}; index={ref.attachment_index}]")
+            else:
+                current_access()
             paths.append(str(downloaded.path))
             mimes.append(downloaded.mime)
         return paths, mimes, notices
 
     async def _close_streams(self) -> None:
+        self._stream_downloader = None
         uploader = getattr(self, "_stream_uploader", None)
         if uploader is not None:
             await uploader.close()
@@ -240,13 +362,14 @@ class MediaAdapterMixin:
             raise MediaError("media source is required")
         source = source.strip()
         if source.startswith("media:"):
-            if kind != "image" or target is None or requester_id is None:
-                raise MediaError("image references require an authenticated same-chat tool call")
+            if kind not in MEDIA_KINDS or target is None or requester_id is None:
+                raise MediaError("media references require an authenticated same-chat tool call")
             identifier = source.removeprefix("media:")
+            self._media_access(identifier, target, requester_id, kind=kind)
             downloaded = await self.resolve_media(identifier, target, requester_id)
             value = await self._media_reference(self.media.cached_reference, downloaded)
-            self._image_access(identifier, target, requester_id)
-            reference = ReferencedMedia(value, identifier, requester_id)
+            self._media_access(identifier, target, requester_id, kind=kind)
+            reference = ReferencedMedia(value, identifier, requester_id, kind)
             reference.transport_reference = value
             return reference
         if is_inline_source(source):
@@ -274,11 +397,20 @@ class MediaAdapterMixin:
     def validate_outbound_media(self, target: Target, value: Any) -> None:
         """Called inside the send gate: recall/expiry while queued must stop the send."""
         if isinstance(value, ReferencedMedia):
-            self._image_access(value.media_id, target, value.requester_id)
+            self._media_access(value.media_id, target, value.requester_id, kind=value.kind)
             self.validate_outbound_media(target, getattr(value, "transport_reference", str(value)))
         elif isinstance(value, StreamedMedia):
             value.validate(self.transport)
         elif isinstance(value, dict):
+            if value.get("type") == "node" and isinstance(value.get("data"), dict):
+                if "id" in value["data"] and self.media_refs.is_recalled(
+                    target.address, message_id(value["data"]["id"])
+                ):
+                    raise MediaError("forwarded source message was recalled")
+            if value.get("type") in MEDIA_KINDS and isinstance(value.get("data"), dict):
+                source = value["data"].get("file")
+                if isinstance(source, ReferencedMedia) and source.kind != value["type"]:
+                    raise MediaError("media reference kind does not match the send segment")
             for item in value.values():
                 self.validate_outbound_media(target, item)
         elif isinstance(value, list):

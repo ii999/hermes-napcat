@@ -4,6 +4,7 @@ import contextvars
 import importlib
 import json
 import sys
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -55,6 +56,26 @@ async def test_private_and_disabled_group_behavior_still_use_base_adapter(group_
     adapter.handle_message.assert_not_called()
     await adapter._receive(event(3, text='explicit', parts=[MENTION]))
     assert adapter.handle_message.await_args.args[0].text == 'explicit'
+    await adapter.disconnect()
+
+
+async def test_group_file_notice_is_lazy_and_cannot_anchor_history(group_adapter):
+    adapter = group_adapter(media={"references": {"enabled": True}})
+    adapter._attachments = AsyncMock()
+    notice = {"post_type": "notice", "notice_type": "group_upload", "self_id": 100,
+              "group_id": 300, "user_id": 200, "time": time.time(),
+              "file": {"id": "opaque-file", "name": "report.pdf", "size": 100}}
+    await adapter._receive(notice)
+    await adapter._receive(notice)
+    rows = adapter.groups.context.records("group:300", limit=10)
+    assert len(rows) == 1
+    refs = adapter.media_refs.for_message(Target.parse("group:300"), rows[0].message_id)
+    assert len(refs) == 1 and refs[0].notice_only
+    adapter._attachments.assert_not_called()
+    adapter.handle_message.assert_not_called()
+    with pytest.raises(ValueError, match="file notices"):
+        await adapter.groups.recent_messages(Target.parse("group:300"), before=rows[0].message_id)
+    adapter.transport.call.assert_not_called()
     await adapter.disconnect()
 
 

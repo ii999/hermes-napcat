@@ -13,6 +13,7 @@ import stat
 import threading
 import time
 import uuid
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, urljoin, urlsplit
@@ -28,8 +29,14 @@ _EXTENSIONS = {
     "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
     "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/mpeg": ".mp3",
     "audio/ogg": ".ogg", "audio/amr": ".amr", "audio/silk": ".silk",
-    "video/mp4": ".mp4", "application/pdf": ".pdf", "text/plain": ".txt",
+    "video/mp4": ".mp4", "video/webm": ".webm", "video/x-msvideo": ".avi",
+    "application/pdf": ".pdf", "text/plain": ".txt",
 }
+_DOCUMENT_SUFFIXES = frozenset((
+    ".pdf", ".txt", ".md", ".csv", ".tsv", ".json", ".xml", ".html", ".log",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp",
+    ".rtf", ".zip", ".tar", ".gz", ".7z", ".rar", ".epub",
+))
 
 
 class MediaError(RuntimeError):
@@ -167,7 +174,7 @@ class MediaStore:
         trusted = current_origin in self._private_origins[direction]
         if host in self._private_hosts[direction] and not trusted:
             raise MediaError("private media service origin does not match its configured origin")
-        if not trusted and policy.mode == "allowlist" and host not in policy.allowed_hosts:
+        if not trusted and policy.mode == "allowlist" and not policy.allows_host(host):
             raise MediaError("media host is not allowlisted")
         with contextlib.suppress(ValueError):
             if not trusted and not public_ip(host):
@@ -196,18 +203,25 @@ class MediaStore:
                     usage += metadata.st_size
             return usage
 
-    async def download(self, url: str, *, kind: str, direction: str = "inbound") -> Downloaded:
+    def _receive_limit(self, max_bytes: int | None) -> int:
+        if max_bytes is not None and (type(max_bytes) is not int or max_bytes <= 0):
+            raise MediaError("media byte allowance must be a positive integer")
+        return min(self.config.max_bytes, max_bytes) if max_bytes is not None else self.config.max_bytes
+
+    async def download(self, url: str, *, kind: str, direction: str = "inbound",
+                       max_bytes: int | None = None) -> Downloaded:
         if not self.config.enabled:
             raise MediaError("media download is disabled")
         if direction not in self._policies:
             raise MediaError("unknown media download direction")
+        limit = self._receive_limit(max_bytes)
         # Hold a reservation for the entire transfer. No concurrent cache quota overcommit.
         async with self._lock:
             with self._storage_lock:
                 usage = self._prune_and_usage()
-                if usage + self.config.max_bytes > self.config.cache_max_bytes:
+                if usage + self._reserved_bytes + limit > self.config.cache_max_bytes:
                     raise MediaError("media cache quota reached; existing recent files are retained")
-                self._reserved_bytes = self.config.max_bytes
+                self._reserved_bytes += limit
             try:
                 attribute = "_session" if direction == "inbound" else "_outbound_session"
                 if getattr(self, attribute) is None:
@@ -220,16 +234,18 @@ class MediaStore:
                     )
                     setattr(self, attribute, session)
                 async with asyncio.timeout(self.config.timeout):
-                    return await self._download(url, kind, direction)
+                    return await self._download(url, kind, direction, max_bytes=limit)
             except (aiohttp.ClientError, TimeoutError, OSError) as exc:
                 raise MediaError(f"media transfer failed ({type(exc).__name__})") from exc
             finally:
                 with self._storage_lock:
-                    self._reserved_bytes = 0
+                    self._reserved_bytes -= limit
 
-    async def _download(self, url: str, kind: str, direction: str = "inbound") -> Downloaded:
+    async def _download(self, url: str, kind: str, direction: str = "inbound", *,
+                        max_bytes: int | None = None) -> Downloaded:
         session = self._session if direction == "inbound" else self._outbound_session
         assert session is not None
+        limit = self._receive_limit(max_bytes)
         for _ in range(4):
             self.validate_url(url, direction=direction)
             async with session.get(url, allow_redirects=False) as response:
@@ -243,7 +259,7 @@ class MediaStore:
                     raise MediaError(f"media server returned HTTP {response.status}")
                 if response.headers.get("Content-Encoding", "identity").lower() != "identity":
                     raise MediaError("encoded media responses are refused")
-                if response.content_length and response.content_length > self.config.max_bytes:
+                if response.content_length and response.content_length > limit:
                     raise MediaError("media exceeds configured byte limit")
                 mime = response.headers.get("Content-Type", "application/octet-stream").split(";")[0].lower()
                 expected = {"image": "image/", "record": "audio/", "video": "video/"}.get(kind)
@@ -260,7 +276,7 @@ class MediaStore:
                     with os.fdopen(descriptor, "wb") as output:
                         async for chunk in response.content.iter_chunked(64 * 1024):
                             size += len(chunk)
-                            if size > self.config.max_bytes:
+                            if size > limit:
                                 raise MediaError("media exceeds configured byte limit")
                             if len(head) < 16:
                                 head = (head + chunk)[:16]
@@ -278,6 +294,95 @@ class MediaStore:
                 finally:
                     temporary.unlink(missing_ok=True)
         raise MediaError("too many media redirects")
+
+    async def import_stream(self, chunks: AsyncIterator[bytes], *, kind: str,
+                            max_bytes: int | None = None,
+                            file_name: Callable[[], str | None] | None = None) -> Downloaded:
+        """Publish owned bytes only after the validated source iterator completes.
+
+        The source owns protocol and authorization checks; this store owns quota,
+        private file creation, byte validation, atomic publication and cleanup.
+        """
+        if not self.config.enabled:
+            raise MediaError("media import is disabled")
+        if kind not in ("image", "record", "video", "file"):
+            raise MediaError("unknown media kind")
+        limit = self._receive_limit(max_bytes)
+        async with self._lock:
+            with self._storage_lock:
+                if self.root.is_symlink() or self.root.resolve() != self.root:
+                    raise MediaError("media cache changed or became a symlink")
+                if self._prune_and_usage() + self._reserved_bytes + limit > self.config.cache_max_bytes:
+                    raise MediaError("media cache quota reached; existing recent files are retained")
+                self._reserved_bytes += limit
+            temporary = self.root / f"napcat_{uuid.uuid4().hex}.bin.part"
+            size, head = 0, b""
+            try:
+                descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(descriptor, "wb") as output:
+                    async for chunk in chunks:
+                        if not isinstance(chunk, bytes) or not chunk:
+                            raise MediaError("media stream supplied an invalid byte chunk")
+                        size += len(chunk)
+                        if size > limit:
+                            raise MediaError("media exceeds configured byte limit")
+                        head = (head + chunk[:16])[:16]
+                        output.write(chunk)
+                if not size:
+                    raise MediaError("media stream was empty")
+                mime = self._stream_mime(head, kind)
+                suffix = _EXTENSIONS.get(mime, ".bin")
+                if kind == "file" and suffix == ".bin" and file_name is not None:
+                    # Preserve document formats for readers without importing remote paths.
+                    name = file_name()
+                    if isinstance(name, str) and len(name) <= 4096:
+                        extension = Path(name.replace("\\", "/")).suffix.lower()
+                        if extension in _DOCUMENT_SUFFIXES:
+                            suffix = extension
+                destination = self.root / f"napcat_{uuid.uuid4().hex}{suffix}"
+                with self._storage_lock:
+                    os.replace(temporary, destination)
+                return Downloaded(destination, mime, size)
+            except OSError as exc:
+                raise MediaError("media cache write failed") from exc
+            finally:
+                try:
+                    temporary.unlink(missing_ok=True)
+                finally:
+                    with self._storage_lock:
+                        self._reserved_bytes -= limit
+
+    @classmethod
+    def _stream_mime(cls, head: bytes, kind: str) -> str:
+        image = cls._image_mime(head)
+        mp3 = head.startswith(b"ID3") or (len(head) >= 2 and head[0] == 0xff
+                                                and head[1] & 0xe0 == 0xe0
+                                                and head[1] & 0x06 != 0)
+        mp4 = len(head) >= 12 and head[4:8] == b"ftyp"
+        video = ("video/mp4" if mp4 else "video/webm" if head.startswith(b"\x1aE\xdf\xa3")
+                 else "video/x-msvideo" if head.startswith(b"RIFF") and head[8:12] == b"AVI "
+                 else None)
+        if kind == "image":
+            if image is None:
+                raise MediaError("unsupported or invalid image bytes")
+            return image
+        if kind == "record":
+            if not mp3:
+                raise MediaError("unsupported or invalid converted MP3 bytes")
+            return "audio/mpeg"
+        if kind == "video":
+            if video is None:
+                raise MediaError("unsupported or invalid video bytes")
+            return video
+        if image:
+            return image
+        if mp3:
+            return "audio/mpeg"
+        if video:
+            return video
+        if head.startswith(b"%PDF-"):
+            return "application/pdf"
+        return "application/octet-stream"
 
     @staticmethod
     def _image_mime(head: bytes) -> str | None:

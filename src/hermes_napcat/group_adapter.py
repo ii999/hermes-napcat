@@ -41,6 +41,7 @@ class GroupNapCatAdapter(NapCatAdapter):
             lambda action, params: self.transport.call(action, params), self._dispatch_group,
             transport_state=lambda: (self.transport.connection_epoch, self.transport.stats.dropped),
             classifier_key=self._classifier_key, media_refs=self.media_refs,
+            file_notices=self._file_notices,
             is_control_reply=self._is_control_reply,
         )
 
@@ -98,6 +99,9 @@ class GroupNapCatAdapter(NapCatAdapter):
         await super().disconnect()
 
     async def _receive(self, raw: dict[str, Any]) -> None:
+        raw = self._file_notices.normalize(raw)
+        if raw is None:
+            return
         if self.settings.group_context.enabled and (
             raw.get("message_type") == "group" or raw.get("notice_type") == "group_recall"
         ):

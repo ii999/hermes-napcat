@@ -65,9 +65,19 @@ def test_media_roots_are_explicit_and_dedicated(tmp_path):
     with pytest.raises(ValidationError):
         SharedPath(hermes=tmp_path, napcat="C:\\")
     with pytest.raises(ValidationError):
-        MediaSettings(allowed_hosts=["*.qq.com"])
-    with pytest.raises(ValidationError):
         MediaSettings(trusted_private_origins=["http://localhost:9/api"])
+
+
+@pytest.mark.parametrize("host", [
+    "*", "*example.com", "cdn.*.example.com", "**.example.com", "*.com", "*..example.com",
+    "*.example..com", "*.-example.com", "*.example-.com", "*.127.0.0.1", "*.[::1]",
+    "*.example.com/path", "*.example.com:443", "*.example.com@evil.test", "*.exa_mple.com",
+    "*.example.com\n", "*." + "a" * 64 + ".com",
+    "*.8.8", "*.127.1", "*.010.010", "*.0x8.0x8",
+])
+def test_media_wildcards_reject_ambiguous_patterns(host):
+    with pytest.raises(ValidationError):
+        MediaSettings(allowed_hosts=[host])
 
 
 def test_agent_qq_tools_are_default_off_and_bounded():

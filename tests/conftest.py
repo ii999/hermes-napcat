@@ -101,7 +101,12 @@ def hermes_doubles(monkeypatch, tmp_path):
         "gateway.platforms.base": {"BasePlatformAdapter": BasePlatformAdapter, "SendResult": SendResult},
         "gateway.platforms.event": {"MessageType": MessageType, "MessageEvent": MessageEvent},
         "gateway.platforms._shared": {"get_scoped_secret": lambda name, default=None: default},
-        "hermes_constants": {"get_hermes_home": lambda: tmp_path / "hermes-home"},
+        "hermes_constants": {
+            "get_hermes_home": lambda: tmp_path / "hermes-home",
+            "get_hermes_dir": lambda relative, legacy=None: tmp_path / "hermes-home" / relative,
+        },
+        "tools": {},
+        "tools.credential_files": {"to_agent_visible_cache_path": lambda path: path},
         "hermes_cli": {},
         "hermes_cli.commands": {"should_bypass_active_session": lambda command: command == "stop"},
     }

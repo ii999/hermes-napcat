@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -51,6 +52,13 @@ class SharedPath(StrictModel):
         return self
 
 
+def _valid_dns_name(host: str) -> bool:
+    return len(host) <= 253 and all(
+        re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) is not None
+        for label in host.split(".")
+    )
+
+
 class MediaURLPolicy(StrictModel):
     """One download direction; public never implies private-network access."""
 
@@ -62,14 +70,29 @@ class MediaURLPolicy(StrictModel):
 
     @field_validator("allowed_hosts")
     @classmethod
-    def exact_hosts(cls, hosts):
+    def validate_hosts(cls, hosts):
         result = []
         for host in hosts:
             host = host.lower().rstrip(".")
-            if not host or any(c in host for c in ("*", "/", "@", ":", " ")):
-                raise ValueError("media.allowed_hosts accepts exact DNS host names")
+            if host.startswith("*."):
+                suffix = host[2:]
+                if "." not in suffix or not _valid_dns_name(suffix):
+                    raise ValueError("media.allowed_hosts wildcard must be *. followed by a DNS domain")
+                # Numeric suffixes can match literal, shortened, octal or hexadecimal IPv4.
+                final_label = suffix.rsplit(".", 1)[-1]
+                if final_label.isdecimal() or re.fullmatch(r"0x[0-9a-f]+", final_label):
+                    raise ValueError("media.allowed_hosts wildcard cannot target an IP address")
+            elif not host or any(c in host for c in ("*", "/", "@", ":", " ")):
+                raise ValueError("media.allowed_hosts accepts exact hosts or *.domain patterns")
             result.append(host)
         return tuple(result)
+
+    def allows_host(self, host: str) -> bool:
+        """Match exact hosts or subdomains, excluding a wildcard's apex domain."""
+        host = host.lower().rstrip(".")
+        return any((_valid_dns_name(host) and host.endswith(pattern[1:]))
+                   if pattern.startswith("*.") else host == pattern
+                   for pattern in self.allowed_hosts)
 
     @field_validator("trusted_private_origins")
     @classmethod
@@ -88,7 +111,7 @@ class MediaURLPolicy(StrictModel):
 
 
 class MediaReferenceSettings(StrictModel):
-    """Opt-in, bounded metadata retention; no background image downloads."""
+    """Opt-in, bounded media metadata retention; no background downloads."""
 
     enabled: bool = False
     ttl_seconds: int = Field(default=1800, ge=30, le=86400)
@@ -115,6 +138,7 @@ class StreamUploadSettings(StrictModel):
 
 class MediaSettings(MediaURLPolicy):
     enabled: bool = True
+    download_mode: Literal["auto", "stream", "http"] = "auto"
     # Unset directions inherit legacy top-level policy fields, without broadening access.
     inbound: MediaURLPolicy | None = None
     outbound: MediaURLPolicy | None = None
@@ -125,6 +149,7 @@ class MediaSettings(MediaURLPolicy):
     base64_batch_max_bytes: int = Field(default=64 * 1024 * 1024, ge=1024, le=512 * 1024 * 1024)
     max_bytes: int = Field(default=32 * 1024 * 1024, ge=1024, le=256 * 1024 * 1024)
     max_attachments: int = Field(default=4, ge=1, le=16)
+    max_turn_bytes: int = Field(default=64 * 1024 * 1024, ge=1024, le=512 * 1024 * 1024)
     timeout: float = Field(default=60, gt=0, le=300)
     cache_max_bytes: int = Field(default=512 * 1024 * 1024, ge=1024)
     cache_ttl_seconds: int = Field(default=86400, ge=3600)
@@ -161,11 +186,15 @@ class QQToolsSettings(StrictModel):
     """Limits and opt-ins for model-callable QQ actions."""
 
     enabled: bool = False
+    read_enabled: bool = False
     allow_cross_chat: bool = False
     max_segments: int = Field(default=64, ge=1, le=256)
     max_media_items: int = Field(default=8, ge=1, le=32)
     max_forward_nodes: int = Field(default=50, ge=1, le=100)
     max_forward_chars: int = Field(default=50_000, ge=100, le=200_000)
+    max_forward_depth: int = Field(default=3, ge=1, le=8)
+    history_limit: int = Field(default=50, ge=1, le=100)
+    history_window_seconds: int = Field(default=1800, ge=30, le=86400)
     max_local_media_bytes: int = Field(
         default=256 * 1024 * 1024,
         ge=1024,
