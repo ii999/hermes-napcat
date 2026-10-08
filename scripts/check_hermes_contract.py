@@ -21,6 +21,10 @@ def main() -> None:
     from hermes_cli.plugins import PluginContext
     from hermes_cli.commands import should_bypass_active_session
     from tools.clarify_gateway import get_pending_for_session
+    from tools.credential_files import to_agent_visible_cache_path
+    from tools.registry import registry
+    from tools.transcription_tools import transcribe_audio, transcribe_audio_local_fallback
+    from hermes_constants import get_hermes_dir
     from hermes_napcat.group_adapter import GroupNapCatAdapter
     from hermes_napcat.plugin import register
 
@@ -38,6 +42,11 @@ def main() -> None:
     assert "include_choice_prompts" in inspect.signature(get_pending_for_session).parameters
     assert "profile" in inspect.signature(GatewayAuthorizationMixin._authorization_adapter).parameters
     assert callable(get_session_env)
+    assert callable(get_hermes_dir) and callable(to_agent_visible_cache_path)
+    assert {"name", "args"}.issubset(inspect.signature(registry.dispatch).parameters)
+    assert "quiet" in inspect.signature(registry.get_definitions).parameters
+    assert "source" in inspect.signature(transcribe_audio).parameters
+    assert callable(transcribe_audio_local_fallback)
     tool_parameters = inspect.signature(PluginContext.register_tool).parameters
     assert {"toolset", "schema", "handler", "is_async"}.issubset(tool_parameters)
     entries = []
@@ -50,11 +59,11 @@ def main() -> None:
     assert entries[0].parse_target_ref_fn("group:12345") == ("group:12345", None)
     assert entries[0].validate_target_ref_fn("12345") is not True
     assert entries[0].check_fn()
-    assert {item["name"] for item in tools} == {
-        "qq_send_message", "qq_send_media", "qq_send_forward", "qq_get_message",
-        "qq_get_chat_info", "qq_get_recent_messages",
-    }
-    assert all(item["toolset"] == "napcat_qq" and item["is_async"] for item in tools)
+    by_name = {item["name"]: item for item in tools}
+    assert by_name["qq_read_media"]["toolset"] == "napcat_qq_read"
+    assert by_name["qq_get_forward"]["toolset"] == "napcat_qq_read"
+    assert by_name["qq_send_message"]["toolset"] == "napcat_qq"
+    assert all(item["is_async"] for item in tools)
     print("PASS: real Hermes imports, adapter contract, platform and QQ tool registration")
     print("This check does not exercise the gateway authorization/session runner or a real QQ account.")
 

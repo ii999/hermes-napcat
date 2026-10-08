@@ -43,6 +43,7 @@ def owned(store, value=PNG):
 def setup_adapter(hermes_doubles, settings, tmp_path, **kwargs):
     values = {"media": {"references": {"enabled": True}}, "qq_tools": {"enabled": True}}
     values.update(kwargs)
+    values["media"] = {"download_mode": "http", **values["media"]}
     adapter = make_adapter(hermes_doubles, settings, **values)
     adapter.media = MediaStore(adapter.settings.media, tmp_path / "cache")
     return adapter
@@ -164,10 +165,11 @@ async def test_expired_url_refreshes_once_through_inbound_downloader(
 ):
     adapter = setup_adapter(hermes_doubles, settings, tmp_path)
     downloaded = owned(adapter.media)
-    adapter.media.download = AsyncMock(side_effect=[MediaError("HTTP 403"), downloaded])
-    adapter.transport.call.return_value = {"url": "https://gchat.qpic.cn/fresh", "file": "/napcat/private"}
+    adapter.media.download = AsyncMock(side_effect=[MediaError("media server returned HTTP 403"), downloaded])
+    adapter.transport.call.return_value = raw_event(
+        message=[image(url="https://gchat.qpic.cn/fresh", file="/napcat/private")], time=time.time())
     await adapter._receive(raw_event(message=[image()]))
-    adapter.transport.call.assert_awaited_once_with("get_image", {"file": "opaque.image"})
+    adapter.transport.call.assert_awaited_once_with("get_msg", {"message_id": -10})
     assert [c.args[0] for c in adapter.media.download.call_args_list] == [
         "https://gchat.qpic.cn/image", "https://gchat.qpic.cn/fresh"]
     delivered = adapter.handle_message.call_args.args[0]
@@ -189,8 +191,11 @@ async def test_received_paths_are_not_used_as_get_image_ids(
 
 async def test_refresh_failure_does_not_retry_forever(hermes_doubles, settings, raw_event, tmp_path):
     adapter = setup_adapter(hermes_doubles, settings, tmp_path)
-    adapter.media.download = AsyncMock(side_effect=MediaError("rejected"))
-    adapter.transport.call.return_value = {"url": "http://169.254.169.254/secret"}
+    adapter.media.download = AsyncMock(side_effect=[
+        MediaError("media server returned HTTP 403"), MediaError("media resolves to a non-public address"),
+    ])
+    adapter.transport.call.return_value = raw_event(
+        message=[image(url="http://169.254.169.254/secret")], time=time.time())
     await adapter._receive(raw_event(message=[image()]))
     assert adapter.media.download.await_count == 2 and adapter.transport.call.await_count == 1
     assert not adapter.handle_message.call_args.args[0].media_urls
@@ -219,7 +224,7 @@ def test_reference_scope_ttl_recall_and_capacity():
 
 
 async def test_group_observation_is_lazy_and_recent_attachment_is_same_speaker(group_adapter, tmp_path):
-    adapter = group_adapter(media={"references": {"enabled": True, "attach_recent": True}},
+    adapter = group_adapter(media={"download_mode": "http", "references": {"enabled": True, "attach_recent": True}},
                             group_context={"enabled": True, "history_backfill": False, "observe_all_members": True})
     adapter.media = MediaStore(adapter.settings.media, tmp_path / "cache")
     adapter.media.download = AsyncMock(return_value=owned(adapter.media))
@@ -238,7 +243,7 @@ async def test_group_observation_is_lazy_and_recent_attachment_is_same_speaker(g
 
 
 async def test_group_quote_attaches_image_without_model_tools(group_adapter, tmp_path):
-    adapter = group_adapter(media={"references": {"enabled": True}},
+    adapter = group_adapter(media={"download_mode": "http", "references": {"enabled": True}},
                             group_context={"enabled": True, "history_backfill": False})
     adapter.media = MediaStore(adapter.settings.media, tmp_path / "cache")
     adapter.media.download = AsyncMock(return_value=owned(adapter.media))
@@ -253,7 +258,7 @@ async def test_group_quote_attaches_image_without_model_tools(group_adapter, tmp
 
 
 async def test_proactive_turn_does_not_read_images(group_adapter, tmp_path):
-    adapter = group_adapter(media={"references": {"enabled": True, "attach_recent": True}})
+    adapter = group_adapter(media={"download_mode": "http", "references": {"enabled": True, "attach_recent": True}})
     adapter.media = MediaStore(adapter.settings.media, tmp_path / "cache")
     adapter.media.download = AsyncMock()
     incoming = Incoming.parse(event(1, parts=[image()]))
@@ -386,9 +391,9 @@ def test_image_registration_independently_checks_message_participants(
     adapter = setup_adapter(hermes_doubles, settings, tmp_path, allowed_users=["200", "201"])
     data = raw_event(message=[image()], time=time.time())
     target = Target.parse("private:200")
-    assert adapter.remember_verified_images(target, "-10", data)
+    assert adapter.remember_verified_media(target, "-10", data)
     data.update(extra)
-    assert not adapter.remember_verified_images(target, "-10", data)
+    assert not adapter.remember_verified_media(target, "-10", data)
 
 
 async def test_malformed_quote_does_not_break_the_current_turn(

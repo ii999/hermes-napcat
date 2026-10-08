@@ -68,6 +68,7 @@ async def standalone_send(pconfig, chat_id, message, *, thread_id=None,
                           media_files=None, force_document=False):
     """Host-driven cron/send delivery, never an agent-callable arbitrary-message tool."""
     from .adapter import NapCatAdapter
+    from .outbound import send_bundle
     if thread_id is not None:
         return {"error": "NapCat has no native threads"}
     adapter = NapCatAdapter(pconfig, receive_events=False)
@@ -76,13 +77,12 @@ async def standalone_send(pconfig, chat_id, message, *, thread_id=None,
     try:
         if not await adapter.connect():
             return {"error": "Could not establish the OneBot sender"}
-        # Do not partially deliver a compound standalone request whose file contract we don't implement.
-        if media_files:
-            return {"error": "Standalone media requests are not supported; use the live adapter"}
-        result = await adapter.send(chat_id, message)
-        if result.success:
-            return {"success": True, "message_id": result.message_id}
-        return {"error": result.error or "QQ delivery failed"}
+        try:
+            target = Target.parse(chat_id)
+        except ValueError:
+            return {"error": "NapCat targets must be private:<QQ> or group:<group-id>"}
+        return await send_bundle(adapter, target, message, media_files,
+                                 force_document=force_document)
     finally:
         await adapter.disconnect()
 

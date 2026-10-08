@@ -1,28 +1,35 @@
 # Merge into the existing Hermes config.yaml. Keep model/provider and current NapCat settings.
 platform_toolsets:
-  napcat: [napcat_qq]
+  napcat: [napcat_qq_read]
 
 gateway:
   platforms:
     napcat:
       enabled: true
       extra:
-        # Keep [] for untrusted groups. Add napcat_qq only where members may invoke these actions.
-        group_toolsets: [napcat_qq]
+        # Keep [] for untrusted groups. Add napcat_qq only to authorize sends as well.
+        group_toolsets: [napcat_qq_read]
         qq_tools:
-          enabled: true
+          enabled: false  # To send: true and add napcat_qq to the relevant Hermes toolsets.
+          read_enabled: true
           allow_cross_chat: false
           max_segments: 64
           max_media_items: 8
           max_forward_nodes: 50
           max_forward_chars: 50000
+          max_forward_depth: 3
+          history_limit: 50
+          history_window_seconds: 1800
           max_local_media_bytes: 268435456
         media:
+          download_mode: auto
+          references:
+            enabled: true
           # Agent-created local files must stay under dedicated roots.
           outbound_roots:
             - /srv/qq-output
           inline_max_bytes: 524288
-          # For files larger than inline_max_bytes, mount the same storage into NapCat.
+          # Optional shared mount; without one larger files can use bounded stream uploads.
           shared_paths:
             - hermes: /srv/qq-output
               napcat: /data/hermes-output

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from aiohttp import web
+from aiohttp.resolver import DefaultResolver
 
 from hermes_napcat.config import MediaSettings
 from hermes_napcat.media import Downloaded, MediaError, MediaStore, SafeResolver
@@ -23,6 +24,10 @@ async def file_server():
         route = request.match_info["route"]
         if route == "redirect-private":
             raise web.HTTPFound("http://127.0.0.1:1/secret")
+        if route == "redirect-wildcard":
+            raise web.HTTPFound("http://cdn.example.com/png")
+        if route == "redirect-outside":
+            raise web.HTTPFound("http://cdn.example.com.evil.test/png")
         if route == "loop":
             raise web.HTTPFound("/loop")
         if route == "huge":
@@ -60,6 +65,54 @@ def test_media_url_rejections(tmp_path, url):
     store = MediaStore(MediaSettings(), tmp_path / "cache")
     with pytest.raises(MediaError):
         store.validate_url(url)
+
+
+@pytest.mark.parametrize("direction", ["inbound", "outbound"])
+def test_media_wildcards_match_only_subdomains_and_preserve_exact_hosts(tmp_path, direction):
+    store = MediaStore(MediaSettings(allowed_hosts=["*.Example.COM.", "exact.test"]), tmp_path / "cache")
+    for host in ("cdn.example.com", "a.b.example.com", "CDN.EXAMPLE.COM.", "exact.test"):
+        url = f"https://{host}/image.png"
+        assert store.validate_url(url, direction=direction) == url
+    for host in (
+        "example.com", "badexample.com", "cdn.example.com.evil.test", "sub.exact.test",
+        "8.8.8.8\x00.example.com", "cdn\x01.example.com", "cdn\x7f.example.com",
+        ".example.com", "a..example.com", "-cdn.example.com", "cdn-.example.com",
+        "cdn_name.example.com", "a" * 64 + ".example.com",
+        ".".join(["a" * 63] * 4) + ".example.com",
+    ):
+        with pytest.raises(MediaError):
+            store.validate_url(f"https://{host}/image.png", direction=direction)
+
+
+def test_media_wildcard_directions_are_independent(tmp_path):
+    store = MediaStore(MediaSettings(
+        inbound={"allowed_hosts": ["*.inbound.test"]},
+        outbound={"allowed_hosts": ["*.outbound.test"]},
+    ), tmp_path / "cache")
+    for direction, other in (("inbound", "outbound"), ("outbound", "inbound")):
+        assert store.validate_url(f"https://cdn.{direction}.test/a", direction=direction)
+        with pytest.raises(MediaError):
+            store.validate_url(f"https://cdn.{other}.test/a", direction=direction)
+        with pytest.raises(MediaError):
+            store.validate_url(f"https://8.8.8.8\x00.{direction}.test/a", direction=direction)
+
+
+@pytest.mark.parametrize("route,reason", [
+    ("redirect-wildcard", "non-public"), ("redirect-outside", "not allowlisted"),
+])
+async def test_wildcard_download_still_checks_redirect_hosts_and_dns(tmp_path, monkeypatch, route, reason):
+    # The initial server is explicitly trusted; a wildcard must not extend that trust.
+    monkeypatch.setattr(DefaultResolver, "resolve", AsyncMock(return_value=[{"host": "127.0.0.1"}]))
+    async with file_server() as origin:
+        store = MediaStore(MediaSettings(
+            allowed_hosts=["*.example.com"], trusted_private_origins=[origin],
+        ), tmp_path / "cache")
+        try:
+            with pytest.raises(MediaError, match=reason):
+                await store.download(origin + "/" + route, kind="image")
+            assert not list(store.root.iterdir())
+        finally:
+            await store.close()
 
 
 async def test_dns_rebinding_and_mixed_addresses_are_rejected():

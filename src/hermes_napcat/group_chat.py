@@ -15,6 +15,7 @@ from typing import Any
 
 from .config import Settings
 from .context import GroupContext, GroupMessage
+from .file_notices import FileNotices
 from .engagement import ParticipationClassifier, WindowBudget, candidate_from_tail
 from .media_refs import MediaReferences
 from .policy import Policy, RecentIDs
@@ -50,6 +51,7 @@ class GroupChatController:
                  transport_state: Callable[[], tuple[int, int]] = lambda: (0, 0),
                  classifier_key: str = "",
                  media_refs: MediaReferences | None = None,
+                 file_notices: FileNotices | None = None,
                  is_control_reply: Callable[[Incoming, str], bool] = (
                      lambda incoming, text: text.lstrip().startswith("/"))):
         self.settings, self.policy, self.call, self.dispatch = settings, policy, call, dispatch
@@ -57,6 +59,7 @@ class GroupChatController:
         self.context = GroupContext(settings, policy, media_refs)
         self.transport_state = transport_state
         self.is_control_reply = is_control_reply
+        self.file_notices = file_notices
         self.classifier = ParticipationClassifier(self.proactive.classifier, classifier_key)
         self.seen = RecentIDs(settings.dedup_capacity, settings.dedup_ttl)
         self._negative_quotes = RecentIDs(settings.dedup_capacity, 30)
@@ -143,9 +146,13 @@ class GroupChatController:
             admitted = (authorized and direct is not None) or self._observe_budget.take(
                 f"{address}:{incoming.user_id}")
             if admitted:
+                if self.file_notices is not None and not self.file_notices.admit(incoming):
+                    return
                 try:
                     self.stats["observed"] += int(self.context.put(incoming))
                 except ValueError:
+                    if self.file_notices is not None:
+                        self.file_notices.discard(incoming)
                     log.warning("Invalid group attribution rejected")
                     return
             else:
@@ -220,6 +227,8 @@ class GroupChatController:
         record = self.context.lookup(address, identifier)
         if record is not None:
             return record
+        if self.file_notices is not None and self.file_notices.is_notice_message(incoming.target, identifier):
+            return None
         key = (address, identifier)
         if self._negative_quotes.contains(key) or not self._read_budget.take(address):
             return None
@@ -441,6 +450,8 @@ class GroupChatController:
             raise ValueError("limit exceeds group_context.history_limit")
         if before is not None:
             before = message_id(before)
+            if self.file_notices is not None and self.file_notices.is_notice_message(target, before):
+                raise ValueError("file notices cannot anchor QQ message history")
             if self.context.lookup(target.address, before) is None:
                 raise ValueError("before_message_id must be in the current retained group context")
             # Anchors come from verified local records; never pass arbitrary model IDs to pagination.

@@ -10,20 +10,21 @@ QQ ↔ NapCat ↔ OneBot v11 WebSocket ↔ Hermes NapCat Plugin ↔ Hermes Gatew
 
 ## 功能概览
 
-| 能力 | 支持范围 |
-| --- | --- |
-| 私聊与群聊 | 用户白名单；群聊同时检查群白名单，支持 @机器人、回复机器人和 `/ai` 前缀触发 |
-| 文本收发 | 引用、长文本分段、结构化消息段；模型输出的 CQ 字符串按普通文本发送 |
-| 图片与其他媒体 | 受控 URL 下载、本地文件、base64/data URI、共享目录及 NapCat 分块上传；不提供音视频转码 |
-| 图片引用 | 可选同会话引用图、同一发言人的近期图片补入，以及通过工具读取或原样回图 |
-| 群聊背景 | 可选实时观察、有界历史回填，保留发言人、时间、@和引用信息；会话仍由 Hermes 管理 |
-| 主动参与 | 可选规则或无工具分类器判断；默认关闭，启用后默认 dry-run，受冷却、预算和回复时效限制 |
-| Agent QQ 工具 | 可选 `napcat_qq` 工具集，支持图文/媒体发送、合并转发、消息/会话读取和近期群消息查询 |
-| 连接与可靠性 | 正向/反向 WebSocket、token 与登录账号核验、心跳、重连、并发请求关联、有界队列、限流和内存去重 |
-| 定时投递 | Hermes 原生目标解析与 cron sender；独立进程仅支持正向连接的文本投递 |
-| 运维 | 配置检查、连接探测、人工测试发送、安装与 Hermes 接口检查脚本 |
+| 能力 | 支持范围 | 验证范围 |
+| --- | --- | --- |
+| 私聊与群聊 | 用户/群白名单，@、回复机器人和 `/ai` 触发 | 模拟接口与 loopback；实机待验收 |
+| 文本收发 | 引用、长文本分段、结构化消息段；CQ 字符串作为普通文本 | 模拟接口；实机待验收 |
+| 媒体接收 | 图片、语音、视频、文件的认证 WS 分块下载；受控 HTTP 兼容模式和文件通知 | NapCat 源码与 loopback；实机待验收 |
+| 媒体引用与理解 | 同会话当前/引用/近期附件、私聊历史和有界合并转发；Hermes 视觉、转录、视频和文档读取 | Hermes 源码与接口替身；模型/STT/沙箱待验收 |
+| 媒体发送 | 本地文件、受控 URL（含 `*.example.com` 白名单）、base64、共享目录和分块上传；已有消息服务端合并转发 | 源码、模拟接口与 loopback；实机待验收 |
+| 群聊背景 | 可选实时观察、有界回填，保留发言人、时间、@和引用 | 模拟接口；实机待验收 |
+| 主动参与 | 默认关闭，启用后默认 dry-run；规则/无工具分类器、冷却和预算 | 模拟接口与本地分类器协议；实机待验收 |
+| Agent QQ 工具 | `napcat_qq_read` 只读与 `napcat_qq` 发送分别授权 | 接口替身；真实工具发现待验收 |
+| 连接与可靠性 | 正向/反向 WS、token/账号核验、重连、echo、队列、限流和内存去重 | 真实 loopback 网络；QQ 断线待验收 |
+| 定时投递 | Hermes 目标解析；独立正向 sender 支持组合文本/本地媒体和 `force_document` | 源码与接口替身；真实 cron 待验收 |
+| 运维 | 配置检查、连接探测、人工测试发送、安装与接口检查 | 本地检查；目标环境待验收 |
 
-群聊背景、主动参与、图片引用和 Agent QQ 工具均需显式启用。群工具集默认为空；普通观察不下载附件，也不授予被观察者调用 Agent 的权限。
+群聊背景、主动参与、媒体引用和 Agent QQ 工具均需显式启用。群工具集默认为空；普通观察不下载附件，也不授予被观察者调用 Agent 的权限。
 
 当前不包含群管理、QQ 空间、持久群历史、Relay、持久消息队列或跨重连上传续传。发送结果不确定时不会自动重发；内存去重也不提供跨进程重启的投递保证。
 
@@ -158,13 +159,13 @@ uv run hermes-napcat --config examples/napcat.yaml send \
 
 ### Agent QQ 工具
 
-在需要的会话工具集中加入 `napcat_qq`，同时设置 `qq_tools.enabled: true`。工具默认绑定当前 QQ 会话。跨会话调用还要求 `allow_cross_chat: true`、当前用户属于 `admins`，并且目标通过白名单检查。
+只读会话加入 `napcat_qq_read` 并设置 `qq_tools.read_enabled: true`；发送另需 `napcat_qq` 与 `qq_tools.enabled: true`。原有 `enabled: true` 也允许读取，但升级后 Hermes 工具集必须另加 `napcat_qq_read` 才能发现读取工具。工具绑定当前 QQ 会话；跨会话还要求 `allow_cross_chat: true`、管理员和目标白名单。
 
-工具可以发送图文、媒体和合并转发，读取消息、会话及近期群消息。`qq_get_media` 返回受控图片缓存路径，需要会话已有的视觉读取工具消费；工具返回的 JSON 不会自动成为模型视觉输入。参数和配置见 [QQ 工具指南](docs/QQ_TOOLS.md) 与 [配置示例](examples/qq-tools.config.yaml)。
+`qq_get_media` 返回受控媒体路径；`qq_read_media` 调用 Hermes 已安装的图片、转录、视频或文档能力，保留原生多模态结果。近期消息支持私聊和群聊，`qq_get_forward` 从已核验父消息有界展开合并转发。缺少能力会明确失败。参数和配置见 [QQ 工具指南](docs/QQ_TOOLS.md) 与 [配置示例](examples/qq-tools.config.yaml)。
 
-### 媒体与图片引用
+### 媒体与受控引用
 
-入站和出站下载策略独立，默认使用 QQ 域名白名单。需要发送公网图床内容时，在 `gateway.platforms.napcat.extra` 下设置：
+入站默认 `media.download_mode: auto`，优先按安全文件标识通过认证 WebSocket 分块下载；`stream` 要求流式能力，`http` 明确选择 HTTP 兼容模式。HTTP 的入站/出站策略独立，默认使用 QQ 域名白名单。需要发送公网图床内容时，在 `gateway.platforms.napcat.extra` 下设置：
 
 ```yaml
 media:
@@ -180,11 +181,13 @@ media:
 | inline 原始媒体 | 10 MiB，另受实际 WebSocket 预算限制 |
 | 单条 WebSocket 消息 | 16 MiB，含 base64 和 JSON 开销 |
 | 分块上传 | 256 MiB，仍受具体媒体来源的大小限制 |
-| 每轮入站附件 | 4 个 |
+| 每轮当前及引用附件 | 4 个，共享 64 MiB 字节预算 |
 
 已有配置中的显式限制继续生效；例如诊断示例保留了 10 MiB 的下载上限。传输优先使用共享路径或专用共享暂存，再选择 base64；超过 inline 预算时默认尝试 NapCat 分块上传。共享路径要求两端实际挂载同一份存储，并让 NapCat 有受控读取权限。NapCat、代理和 QQ 的实际限制还需单独验证。分块参数、base64 格式与失败处理见 [上传指南](docs/STREAM_UPLOAD.md)。
 
-设置 `media.references.enabled: true` 可启用同会话引用图补入；`attach_recent` 另行控制同一发言人的近期图片。群里“先发图再 @”还需要群上下文观察。普通观察只记录短期引用，不下载全群附件；主动参与不会自动读图。引用过期或收到撤回通知后停止后续读取/发送，已交给模型的数据无法收回，断线期间丢失的撤回通知也无法可靠补齐。
+设置 `media.references.enabled: true` 为图片、语音、视频和文件启用同会话引用。当前附件先占预算，再补入明确引用；无当前附件且无明确引用时，才按 `attach_recent` 选择同一发言人的近期附件。群里“先发图再 @”还需要群上下文观察。普通观察只保留短期元数据，主动参与不自动下载附件。引用过期或撤回后停止后续读取/发送，已交给模型的数据无法收回。
+
+独立正向 cron sender 接受 Hermes 的 `(local_path, is_voice)` 媒体列表并预检整个文本/媒体组合；`force_document` 将媒体按文件投递。路径仍需 `outbound_roots` 或共享映射授权，反向独立 sender 不支持。真实 cron 与部署路径需单独验收。
 
 配置修改后需重启 Gateway。
 
@@ -238,7 +241,7 @@ uv build
 | --- | --- |
 | [架构](docs/ARCHITECTURE.md) | 模块职责与消息链路 |
 | [群聊](docs/GROUP_CHAT.md) | 背景观察、历史回填、主动参与和隐私边界 |
-| [媒体](docs/MEDIA.md) | 下载策略、共享目录、图片引用和撤回 |
+| [媒体](docs/MEDIA.md) | 流式下载、理解能力、共享目录、媒体引用和撤回 |
 | [流式上传](docs/STREAM_UPLOAD.md) | 分块上传、base64 输入、资源限制与失败语义 |
 | [QQ 工具](docs/QQ_TOOLS.md) | 工具参数、会话权限和部分成功处理 |
 | [兼容性](docs/COMPATIBILITY.md) | 上游源码核验基准与升级约束 |

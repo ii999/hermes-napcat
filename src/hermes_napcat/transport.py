@@ -7,7 +7,7 @@ import hmac
 import json
 import logging
 import random
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,6 +42,83 @@ class IdentityError(OneBotError):
     pass
 
 
+class StreamProtocolError(OneBotError):
+    """The peer did not send valid stream response envelopes."""
+
+
+class StreamLimitError(StreamProtocolError):
+    """The response exceeded its frame count or queued byte allowance."""
+
+
+class StreamDisconnected(OneBotError):
+    """A read stream lost its authenticated connection."""
+
+
+class UnsupportedAction(ActionError):
+    """NapCat explicitly rejected an unknown API before producing stream data."""
+
+
+class StreamActionError(ActionError):
+    def __init__(self, action: str, retcode: Any, *, unavailable: bool = False):
+        super().__init__(action, retcode)
+        self.unavailable = unavailable
+
+
+class _PendingStream:
+    def __init__(self, action: str, epoch: int, max_frames: int, max_buffer_bytes: int):
+        self.action, self.epoch = action, epoch
+        self.max_frames, self.max_buffer_bytes = max_frames, max_buffer_bytes
+        self.queue: asyncio.Queue = asyncio.Queue(max_frames)
+        self.frames = 0
+        self.buffer_bytes = 0
+        self.closed = False
+        self.failed = False
+
+    def fail(self, error: OneBotError) -> None:
+        if self.failed:
+            return
+        self.closed = self.failed = True
+        while not self.queue.empty():
+            self.queue.get_nowait()
+        self.buffer_bytes = 0
+        self.queue.put_nowait((error, 0))
+
+    def admit(self, payload: dict, size: int) -> None:
+        if self.closed:
+            return
+        self.frames += 1
+        if self.frames > self.max_frames or self.buffer_bytes + size > self.max_buffer_bytes:
+            self.fail(StreamLimitError("OneBot stream response limit exceeded"))
+            return
+        if payload.get("status") != "ok" or type(payload.get("retcode")) is not int or payload["retcode"] != 0:
+            # Unknown APIs are non-stream responses. A resource/permission error is not
+            # permission to use a different download channel.
+            if (self.frames == 1 and payload.get("status") == "failed"
+                    and type(payload.get("retcode")) is int and payload["retcode"] == 1404
+                    and payload.get("stream") == "normal-action"):
+                error = UnsupportedAction(self.action, 1404)
+            else:
+                unavailable = (self.frames == 1 and payload.get("status") == "failed"
+                               and type(payload.get("retcode")) is int
+                               and payload["retcode"] == 1200
+                               and payload.get("stream") == "stream-action"
+                               and payload.get("message") in (
+                                   "Download failed: file not found",
+                                   "Download failed: element not found"))
+                error = StreamActionError(self.action, payload.get("retcode"),
+                                          unavailable=unavailable)
+            self.fail(error)
+            return
+        data = payload.get("data")
+        if (payload.get("stream") != "stream-action" or not isinstance(data, dict)
+                or data.get("type") not in ("stream", "response")):
+            self.fail(StreamProtocolError("invalid OneBot stream response envelope"))
+            return
+        self.buffer_bytes += size
+        self.queue.put_nowait((data, size))
+        self.closed = data["type"] == "response"
+
+
 @dataclass
 class Stats:
     connections: int = 0
@@ -64,6 +141,7 @@ class OneBotTransport:
         self._session: aiohttp.ClientSession | None = None
         self._runner: web.AppRunner | None = None
         self._pending: dict[str, asyncio.Future] = {}
+        self._streams: dict[str, _PendingStream] = {}
         self._queue: asyncio.Queue = asyncio.Queue(config.event_queue_size)
         self._recalls: asyncio.Queue = asyncio.Queue(config.event_queue_size)
         self._queued_event_bytes = 0
@@ -88,7 +166,7 @@ class OneBotTransport:
 
     @property
     def pending_count(self) -> int:
-        return len(self._pending)
+        return len(self._pending) + len(self._streams)
 
     async def start(self) -> None:
         if self.running:
@@ -250,6 +328,7 @@ class OneBotTransport:
 
     async def _receive(self, ws, validated: asyncio.Event, preauth: list[dict]) -> None:
         preauth_bytes = 0
+        epoch = self._epoch
         async for message in ws:
             if message.type != aiohttp.WSMsgType.TEXT:
                 if message.type == aiohttp.WSMsgType.ERROR:
@@ -267,12 +346,18 @@ class OneBotTransport:
             if "echo" in payload and "post_type" not in payload:
                 echo = payload.get("echo")
                 future = self._pending.get(echo) if isinstance(echo, str) else None
-                if future is not None and not future.done():
+                stream = self._streams.get(echo) if isinstance(echo, str) else None
+                if (stream is not None and not stream.closed and stream.epoch == epoch
+                        and self._ws is ws):
+                    self.stats.responses += 1
+                    stream.admit(payload, len(message.data.encode("utf-8")))
+                elif future is not None and not future.done():
                     self.stats.responses += 1
                     future.set_result(payload)
                 else:
                     self.stats.late_responses += 1
-            elif payload.get("post_type") == "message" or self._accept_recall(payload):
+            elif (payload.get("post_type") == "message" or self._accept_recall(payload)
+                  or self._accept_file_notice(payload)):
                 if validated.is_set():
                     self._enqueue(payload)
                 elif (len(preauth) < self.config.event_queue_size
@@ -284,6 +369,11 @@ class OneBotTransport:
                     self.stats.dropped += 1
                     log.warning("Pre-auth event buffer full; message dropped")
         self._fail_pending()
+
+    def _accept_file_notice(self, event: dict) -> bool:
+        return (self.config.media.enabled and event.get("post_type") == "notice"
+                and str(event.get("self_id")) == self.config.self_id
+                and event.get("notice_type") in ("group_upload", "offline_file"))
 
     def _accept_recall(self, event: dict) -> bool:
         if (event.get("post_type") != "notice"
@@ -344,7 +434,8 @@ class OneBotTransport:
         while True:
             event, admitted_bytes = await self._queue.get()
             # Serialize adapter admission per conversation, without blocking the WS response reader.
-            kind = ("group" if event.get("notice_type") == "group_recall"
+            kind = ("group" if event.get("notice_type") in ("group_recall", "group_upload")
+                    else "private" if event.get("notice_type") == "offline_file"
                     else event.get("message_type"))
             key = f"{kind}:{event.get('group_id') if kind == 'group' else event.get('user_id')}"
             lock, count = self._chat_locks.get(key, (asyncio.Lock(), 0))
@@ -412,7 +503,64 @@ class OneBotTransport:
             elif not future.cancelled():
                 future.exception()
 
+    async def stream_call(self, action: str, params: dict[str, Any] | None = None, *,
+                          timeout: float, max_frames: int, max_buffer_bytes: int,
+                          expected_epoch: int | None = None) -> AsyncIterator[dict[str, Any]]:
+        """Read a bounded multi-envelope action on one authenticated socket attachment.
+
+        Consumers that stop early must close the iterator (e.g. with aclosing).
+        This read-only stream never uses the delivery-ambiguity contract of call().
+        """
+        import uuid
+        if not 0 < timeout <= 300:
+            raise ValueError("stream timeout must be within (0, 300]")
+        if (type(max_frames) is not int or not 1 <= max_frames <= 1_000_000
+                or type(max_buffer_bytes) is not int or not 1 <= max_buffer_bytes <= 1024**3):
+            raise ValueError("stream frame and buffer limits must be positive and bounded")
+        ws, epoch = self._ws, self._epoch
+        if (ws is None or ws.closed or not self.ready.is_set()
+                or (expected_epoch is not None and epoch != expected_epoch)):
+            raise NotConnected("OneBot is not ready for a stream read")
+        echo = f"{epoch}:{uuid.uuid4().hex}"
+        request = json.dumps({"action": action, "params": params or {}, "echo": echo},
+                             ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        if len(request.encode("utf-8")) > self.config.ws_max_bytes:
+            raise StreamLimitError("outbound stream request exceeds configured frame limit")
+        pending = _PendingStream(action, epoch, max_frames, max_buffer_bytes)
+        self._streams[echo] = pending
+        deadline = asyncio.get_running_loop().time() + timeout
+        try:
+            async with asyncio.timeout_at(deadline):
+                async with self._send_lock:
+                    if self._ws is not ws or ws.closed or self._epoch != epoch or not self.ready.is_set():
+                        raise NotConnected("OneBot changed before stream write")
+                    await ws.send_str(request)
+            while True:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("OneBot stream deadline exceeded")
+                # The timeout context ends before yielding so a consumer's own work
+                # cannot be cancelled by a suspended iterator's deadline timer.
+                async with asyncio.timeout_at(deadline):
+                    data, size = await pending.queue.get()
+                pending.buffer_bytes -= size
+                if isinstance(data, OneBotError):
+                    raise data
+                if self._ws is not ws or self._epoch != epoch or not self.connected:
+                    raise StreamDisconnected("OneBot connection changed during stream read")
+                yield data
+                if data["type"] == "response":
+                    return
+        except (aiohttp.ClientError, OSError) as exc:
+            raise StreamDisconnected("OneBot stream connection failed") from exc
+        finally:
+            self._streams.pop(echo, None)
+            while not pending.queue.empty():
+                pending.queue.get_nowait()
+            pending.buffer_bytes = 0
+
     def _fail_pending(self) -> None:
         for future in self._pending.values():
             if not future.done():
                 future.set_exception(DeliveryUncertain("Delivery outcome unknown; verify before retrying"))
+        for stream in self._streams.values():
+            stream.fail(StreamDisconnected("OneBot disconnected during stream read"))

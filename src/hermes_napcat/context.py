@@ -7,10 +7,11 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any
+from functools import partial
+from typing import Any, Callable
 
 from .config import GroupContextSettings, Settings, numeric_id
-from .media_refs import MediaReferences
+from .media_refs import MediaReference, MediaReferences
 from .policy import Policy, RecentIDs
 from .protocol import Incoming, Target, message_id
 
@@ -39,7 +40,17 @@ class GroupMessage:
     time_inferred: bool = False
     truncated: bool = False
     own: bool = False
-    image_refs: tuple[tuple[str, int], ...] = ()
+    _media_lookup: Callable[[], tuple[MediaReference, ...]] | None = field(
+        default=None, repr=False, compare=False)
+
+    @property
+    def media_refs(self) -> tuple[MediaReference, ...]:
+        return self._media_lookup() if self._media_lookup is not None else ()
+
+    @property
+    def image_refs(self) -> tuple[tuple[str, int], ...]:
+        return tuple((ref.media_id, ref.image_index) for ref in self.media_refs
+                     if ref.kind == "image" and ref.image_index is not None)
 
     @classmethod
     def from_incoming(cls, incoming: Incoming, limit: int, *, history: bool = False):
@@ -72,6 +83,7 @@ class GroupMessage:
         )
 
     def as_dict(self) -> dict[str, Any]:
+        refs = self.media_refs
         return {
             "message_id": self.message_id,
             "sender": {"user_id": self.user_id, "name": self.name, "group_role": self.role},
@@ -80,8 +92,8 @@ class GroupMessage:
             "mentions": list(self.mentions), "reply_to": self.reply_to,
             "attachments": list(self.attachments), "text_truncated": self.truncated,
             "bot": self.own,
-            "image_refs": [{"media_id": identifier, "image_index": index, "type": "image"}
-                           for identifier, index in self.image_refs],
+            "media_refs": [ref.summary() for ref in refs],
+            "image_refs": [ref.summary() for ref in refs if ref.kind == "image"],
         }
 
 
@@ -137,11 +149,13 @@ class GroupContext:
         if record.timestamp < time.time() - self.config.history_window_seconds:
             return False
         room = self.room(incoming.target.address)
+        if self.settings.media.enabled:
+            self.media_refs.remember(incoming, timestamp=record.timestamp)
         if record.message_id in room.messages:
             return False  # Backfill and echoes never overwrite a live observation.
         if self.settings.media.enabled:
-            refs = self.media_refs.remember(incoming, timestamp=record.timestamp)
-            record = replace(record, image_refs=tuple((r.media_id, r.image_index) for r in refs))
+            record = replace(record, _media_lookup=partial(
+                self.media_refs.for_message, incoming.target, incoming.message_id))
         room.messages[record.message_id] = record
         # Retain newest event-time records, not the last records ingested by a backfill.
         ordered = sorted(room.messages.values(), key=lambda item: item.timestamp)

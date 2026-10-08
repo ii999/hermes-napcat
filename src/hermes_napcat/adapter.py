@@ -11,11 +11,13 @@ from urllib.parse import urlsplit
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_dir
 
 from .media import MediaError, MediaStore, is_inline_source
 from .media_adapter import MediaAdapterMixin
 from .media_refs import MediaReferences
+from .file_notices import FileNotices
+from .outbound import PreparedMedia, validate_request_sizes
 from .plugin import settings_from_platform
 from .policy import Policy
 from .protocol import (
@@ -40,6 +42,7 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
         self.media_refs = MediaReferences(self.settings.self_id, self.settings.media.references,
                                           per_message=self.settings.media.max_attachments)
         self._media_read_gate = asyncio.Lock()
+        self._file_notices = FileNotices(self.settings)
         self._send_gate = asyncio.Lock()
         self._agent_actions: dict[str, asyncio.Task[Any]] = {}
 
@@ -47,7 +50,8 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
         if self.transport.running:
             return True
         try:
-            self.media = MediaStore(self.settings.media, Path(get_hermes_home()) / "cache" / "napcat")
+            self.media = MediaStore(
+                self.settings.media, Path(get_hermes_dir("cache/documents", "document_cache")) / "napcat")
             await self.transport.start()
             self._mark_connected()
             return True
@@ -63,6 +67,7 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
             await self.media.close()
             self.media = None
         self.media_refs.clear()
+        self._file_notices.clear()
         self._mark_disconnected()
 
     @staticmethod
@@ -92,6 +97,9 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
         return False
 
     async def _receive(self, raw: dict[str, Any]) -> None:
+        raw = self._file_notices.normalize(raw)
+        if raw is None:
+            return
         if self._consume_media_recall(raw):
             return
         try:
@@ -113,6 +121,8 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
         own_reply = await self._verified_reply(incoming)
         text = self.policy.trigger(incoming, own_reply)
         if text is None:
+            return
+        if not self._file_notices.admit(incoming):
             return
         self.policy.seen.add(key)
         try:
@@ -150,6 +160,7 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
             await self.handle_message(event)
         except BaseException:
             self.policy.seen.discard(key)
+            self._file_notices.discard(incoming)
             raise
 
     def toolsets_for_source(self, source):
@@ -215,6 +226,16 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
         return await asyncio.shield(task)
 
     async def send_agent_media(
+        self, target: Target, kind: str, source: str, *, caption: str | None = None,
+        file_name: str | None = None, thumbnail: str | None = None,
+        reply_to: str | None = None, requester_id: str | None = None,
+    ) -> dict[str, Any]:
+        prepared = await self.prepare_media(
+            target, kind, source, caption=caption, file_name=file_name, thumbnail=thumbnail,
+            reply_to=reply_to, requester_id=requester_id)
+        return await self.send_prepared_media(prepared)
+
+    async def prepare_media(
         self,
         target: Target,
         kind: str,
@@ -225,8 +246,8 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
         thumbnail: str | None = None,
         reply_to: str | None = None,
         requester_id: str | None = None,
-    ) -> dict[str, Any]:
-        """Send one validated media item and preserve partial-delivery state."""
+    ) -> PreparedMedia:
+        """Validate and stage one media item without sending a QQ message."""
         if kind not in ("image", "audio", "video", "file"):
             raise ValueError("unsupported media type")
         if not self.policy.can_send(target):
@@ -258,18 +279,26 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
             thumb_reference = await self.outbound_reference(
                 thumbnail, kind="image", target=target, requester_id=requester_id)
 
+        return PreparedMedia(target, kind, reference, thumb_reference, caption, name, reply_to)
+
+    async def send_prepared_media(self, prepared: PreparedMedia) -> dict[str, Any]:
+        """Deliver a prepared item, preserving partial and uncertain acknowledgments."""
+        target, kind = prepared.target, prepared.kind
+        if not self.policy.can_send(target):
+            raise PermissionError("target is not allowlisted")
+        requests = prepared.requests()
+        validate_request_sizes(requests, self.settings.ws_max_bytes)
+        action, params = requests[0]
         ids: list[str] = []
         if kind == "file":
             async with self._send_gate:
-                self.validate_outbound_media(target, reference)
+                self.validate_outbound_media(target, params)
                 upload = await self.transport.call(
-                    f"upload_{target.kind}_file",
-                    {**target.params, "file": reference, "name": name, "upload_file": True},
-                    **self.media_send_kwargs(target, reference),
+                    action, params, **self.media_send_kwargs(target, params),
                 )
-            if caption:
+            if len(requests) > 1:
                 try:
-                    ids.append(await self._send_parts(target, text_segments(caption, reply_to)))
+                    ids.append(await self._send_action_with_id(target, *requests[1]))
                 except (OneBotError, MediaError, ValueError, PermissionError) as exc:
                     return {
                         "success": False,
@@ -287,19 +316,11 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
                 "message_ids": ids,
             }
 
-        segment_kind = "record" if kind == "audio" else kind
-        data = {"file": reference}
-        if thumb_reference is not None:
-            data["thumb"] = thumb_reference
-        prefix = ([{"type": "reply", "data": {"id": reply_to}}] if reply_to else [])
-        if kind == "image" and caption:
-            prefix.append({"type": "text", "data": {"text": caption}})
-        ids.append(await self._send_parts(
-            target, [*prefix, {"type": segment_kind, "data": data}]))
+        ids.append(await self._send_action_with_id(target, action, params))
         # QQ clients handle voice/video captions more consistently as a separate message.
-        if kind in ("audio", "video") and caption:
+        if len(requests) > 1:
             try:
-                ids.append(await self._send_parts(target, text_segments(caption)))
+                ids.append(await self._send_action_with_id(target, *requests[1]))
             except (OneBotError, MediaError, ValueError, PermissionError) as exc:
                 return {
                     "success": False,
@@ -359,21 +380,31 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
         if not self.policy.can_send(target):
             raise PermissionError("target is not allowlisted")
         identifier = message_id(identifier)
+        if self._file_notices.is_notice_message(target, identifier):
+            raise PermissionError("file notices have no retrievable QQ message; use their media reference")
+        if self.media_refs.is_recalled(target.address, identifier):
+            raise PermissionError("message was recalled")
         data = await self.transport.call("get_msg", {"message_id": int(identifier)})
+        if self.media_refs.is_recalled(target.address, identifier):
+            raise PermissionError("message was recalled during the read")
         if not isinstance(data, dict) or data.get("message_type") != target.kind:
             raise PermissionError("message does not belong to the target conversation")
+        if ((data.get("self_id") is not None and str(data["self_id"]) != self.settings.self_id)
+                or (data.get("message_id") is not None and message_id(data["message_id"]) != identifier)):
+            raise PermissionError("message identity does not match the requested account and message")
+        sender = data.get("sender") if isinstance(data.get("sender"), dict) else {}
+        author = str(data.get("user_id") or sender.get("user_id") or "")
+        if sender.get("user_id") is not None and str(sender["user_id"]) != author:
+            raise PermissionError("message sender attribution is inconsistent")
         if target.kind == "group":
             belongs = str(data.get("group_id")) == target.id
         else:
-            sender = data.get("sender") if isinstance(data.get("sender"), dict) else {}
-            author = str(data.get("user_id") or sender.get("user_id") or "")
             destination = str(data.get("target_id") or "")
             belongs = (
-                identifier == current_message_id
-                or author == target.id
-                or destination == target.id
-                or (author == self.settings.self_id
-                    and self.policy.own.contains((target.address, identifier)))
+                (author == target.id and destination in ("", target.id, self.settings.self_id))
+                or (author == self.settings.self_id and (
+                    destination == target.id or (not destination
+                    and self.policy.own.contains((target.address, identifier)))))
             )
         if not belongs:
             raise PermissionError("message does not belong to the target conversation")

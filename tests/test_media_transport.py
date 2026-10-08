@@ -27,7 +27,7 @@ async def test_queued_image_is_revalidated_at_websocket_write(
 ):
     async with fake_napcat() as server:
         options = {"ws_url": server["url"], "token": settings().token,
-                   "media": {"references": {"enabled": True}}}
+                   "media": {"download_mode": "http", "references": {"enabled": True}}}
         adapter = (group_adapter(**options) if kind == "group"
                    else make_adapter(hermes_doubles, settings, **options))
         adapter.media = MediaStore(adapter.settings.media, tmp_path / "cache")
@@ -77,7 +77,7 @@ async def test_recall_can_invalidate_image_while_only_message_worker_is_busy(
     async with fake_napcat() as server:
         adapter = make_adapter(
             hermes_doubles, settings, ws_url=server["url"], event_workers=1,
-            media={"references": {"enabled": True}},
+            media={"download_mode": "http", "references": {"enabled": True}},
         )
         adapter.media = MediaStore(adapter.settings.media, tmp_path / "cache")
         entered, release = asyncio.Event(), asyncio.Event()
@@ -169,3 +169,51 @@ async def test_original_group_recall_without_media_references_is_still_delivered
             assert received == [notice]
         finally:
             await transport.stop()
+
+
+@pytest.mark.parametrize("kind", ["private", "group"])
+async def test_verified_existing_forward_node_is_recalled_while_waiting_for_write_lock(
+    hermes_doubles, settings, tmp_path, kind,
+):
+    async def reply(ws, request):
+        data = {"message_id": 12}
+        if request["action"] == "get_msg":
+            data.update(message_type=kind, self_id=100, user_id=200,
+                        sender={"user_id": 200}, group_id=300, time=time.time(),
+                        message=[image()])
+        await ws.send_json({"status": "ok", "retcode": 0, "data": data,
+                            "echo": request["echo"]})
+
+    async with fake_napcat(reply) as server:
+        adapter = make_adapter(hermes_doubles, settings, ws_url=server["url"],
+                               media={"references": {"enabled": True}})
+        adapter.media = MediaStore(adapter.settings.media, tmp_path / "cache")
+        adapter.transport = OneBotTransport(adapter.settings, adapter._receive)
+        target = Target.parse("group:300" if kind == "group" else "private:200")
+        nodes = [{"type": "node", "data": {"id": "12"}}]
+        send = None
+        try:
+            await adapter.transport.start()
+            assert await adapter.verified_message(target, "12")
+            await adapter.transport._send_lock.acquire()
+            send = asyncio.create_task(adapter.send_agent_forward(target, nodes))
+            await wait_until(lambda: adapter.transport.pending_count == 1)
+            await server["ws"].send_json({
+                "post_type": "notice", "self_id": 100, "message_id": 12,
+                "notice_type": "group_recall" if kind == "group" else "friend_recall",
+                "group_id": 300, "user_id": 200,
+            })
+            await wait_until(lambda: adapter.media_refs.is_recalled(target.address, "12"))
+            adapter.transport._send_lock.release()
+            with pytest.raises(MediaError, match="recalled"):
+                await send
+            assert nodes == [{"type": "node", "data": {"id": "12"}}]
+            assert not any(request["action"].startswith("send_") for request in server["requests"])
+            assert adapter.transport.pending_count == 0
+        finally:
+            if adapter.transport._send_lock.locked():
+                adapter.transport._send_lock.release()
+            if send is not None and not send.done():
+                send.cancel()
+                await asyncio.gather(send, return_exceptions=True)
+            await adapter.disconnect()
