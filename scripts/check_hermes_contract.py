@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 
 def main() -> None:
-    from gateway.config import PlatformConfig
+    from gateway.config import Platform, PlatformConfig
     from gateway.authz_mixin import GatewayAuthorizationMixin
     from gateway.platform_registry import PlatformEntry
     from gateway.platforms.base import BasePlatformAdapter
@@ -37,6 +37,9 @@ def main() -> None:
     }.issubset(inspect.signature(MessageEvent).parameters)
     assert "scope_id" in inspect.signature(BasePlatformAdapter.build_source).parameters
     assert "event" in inspect.signature(BasePlatformAdapter.on_processing_start).parameters
+    assert "handler" in inspect.signature(BasePlatformAdapter.set_message_handler).parameters
+    assert {"event", "session_key", "text_content", "metadata", "reply_to", "is_ephemeral_response"}.issubset(
+        inspect.signature(BasePlatformAdapter.send_final_ledgered).parameters)
     assert "event" in inspect.signature(BasePlatformAdapter._event_session_key).parameters
     assert callable(should_bypass_active_session)
     assert "include_choice_prompts" in inspect.signature(get_pending_for_session).parameters
@@ -64,8 +67,19 @@ def main() -> None:
     assert by_name["qq_get_forward"]["toolset"] == "napcat_qq_read"
     assert by_name["qq_send_message"]["toolset"] == "napcat_qq"
     assert all(item["is_async"] for item in tools)
+    # Exercise the host's native chat grant with test-owned IDs, without a gateway or secrets.
+    probe = SimpleNamespace(_adapter_extra_for_source=lambda source: {
+        "group_allowed_chats": ["group:300"]})
+    for chat_type, target, expected in (
+        ("group", "group:300", True), ("group", "group:301", False),
+        ("dm", "private:300", False),
+    ):
+        source = SimpleNamespace(platform=Platform("napcat"), chat_id=target, is_bot=False)
+        assert GatewayAuthorizationMixin._chat_scoped_grant(
+            probe, source, None, chat_type == "group", False) is expected
     print("PASS: real Hermes imports, adapter contract, platform and QQ tool registration")
-    print("This check does not exercise the gateway authorization/session runner or a real QQ account.")
+    print("PASS: Hermes native group grant helper isolates group IDs from private chats")
+    print("This check does not exercise the full gateway/session runner or a real QQ account.")
 
 
 if __name__ == "__main__":

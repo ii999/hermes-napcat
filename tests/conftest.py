@@ -81,6 +81,7 @@ def hermes_doubles(monkeypatch, tmp_path):
             self.platform = platform
             self.handle_message = AsyncMock()
             self.marked_connected = False
+            self.delivery_obligations = []
 
         def build_source(self, **kwargs):
             return SimpleNamespace(platform=self.platform, **kwargs)
@@ -93,6 +94,16 @@ def hermes_doubles(monkeypatch, tmp_path):
 
         async def on_processing_start(self, event):
             pass
+
+        def set_message_handler(self, handler):
+            self._message_handler = handler
+
+        async def send_final_ledgered(self, event, session_key, text_content, metadata, *,
+                                      reply_to, is_ephemeral_response=False):
+            # Simulate the inspected contract: persist before sending, including failures.
+            self.delivery_obligations.append((event.source.chat_id, text_content))
+            result = await self.send(event.source.chat_id, text_content, reply_to, metadata)
+            return result, self
 
     contents = {
         "gateway": {},

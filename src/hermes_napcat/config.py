@@ -250,6 +250,20 @@ class ClassifierSettings(StrictModel):
         return self
 
 
+class ContinuationSettings(StrictModel):
+    enabled: bool = False
+    idle_seconds: float = Field(default=120, ge=5, le=1800)
+    max_duration_seconds: float = Field(default=600, ge=5, le=3600)
+    max_responses_per_hour: int = Field(default=30, ge=1, le=300)
+    max_decisions_per_hour: int = Field(default=120, ge=1, le=600)
+
+    @model_validator(mode="after")
+    def validate_window(self):
+        if self.max_duration_seconds < self.idle_seconds:
+            raise ValueError("continuation.max_duration_seconds must be >= idle_seconds")
+        return self
+
+
 class ProactiveSettings(StrictModel):
     enabled: bool = False
     dry_run: bool = True
@@ -262,6 +276,7 @@ class ProactiveSettings(StrictModel):
     max_reply_age_seconds: float = Field(default=90, ge=5, le=300)
     ignored_users: tuple[str, ...] = ()  # Explicit sibling-bot IDs; QQ has no reliable is_bot flag.
     classifier: ClassifierSettings = Field(default_factory=ClassifierSettings)
+    continuation: ContinuationSettings = Field(default_factory=ContinuationSettings)
 
     @field_validator("ignored_users", mode="before")
     @classmethod
@@ -282,6 +297,7 @@ class Settings(StrictModel):
     allow_insecure_ws: bool = False
     allowed_users: tuple[str, ...] = ()
     allowed_groups: tuple[str, ...] = ()
+    group_allowed_chats: tuple[str, ...] = ()
     allow_all_users: bool = False
     admins: tuple[str, ...] = ()
     group_mention: bool = True
@@ -320,6 +336,18 @@ class Settings(StrictModel):
             raise ValueError("use a YAML list of QQ IDs")
         return tuple(dict.fromkeys(numeric_id(v) for v in value))
 
+    @field_validator("group_allowed_chats", mode="before")
+    @classmethod
+    def normalize_group_grants(cls, value):
+        if not isinstance(value, (tuple, list)):
+            raise ValueError("group_allowed_chats must be a YAML list of group:<QQ group ID> targets")
+        grants = []
+        for target in value:
+            if not isinstance(target, str) or not target.startswith("group:"):
+                raise ValueError("group_allowed_chats accepts only explicit group:<QQ group ID> targets")
+            grants.append(f"group:{numeric_id(target[6:])}")
+        return tuple(dict.fromkeys(grants))
+
     @field_validator("token")
     @classmethod
     def require_token(cls, value):
@@ -337,13 +365,18 @@ class Settings(StrictModel):
 
     @model_validator(mode="after")
     def validate_transport(self):
+        if any(target[6:] not in self.allowed_groups for target in self.group_allowed_chats):
+            raise ValueError("every group_allowed_chats target must also appear in allowed_groups")
         if self.group_context.enabled and len(self.allowed_groups) > self.group_context.max_groups:
             raise ValueError("allowed_groups exceeds group_context.max_groups")
-        if self.proactive_assist.enabled:
+        if self.proactive_assist.enabled or self.proactive_assist.continuation.enabled:
             if not self.group_context.enabled or not self.group_context.observe_untriggered:
                 raise ValueError("proactive assist requires enabled live group context")
             if not self.proactive_assist.dry_run and self.group_toolsets:
                 raise ValueError("live proactive assist requires group_toolsets=[]")
+        if (self.proactive_assist.continuation.enabled
+                and not self.proactive_assist.classifier.enabled and self.group_toolsets):
+            raise ValueError("Hermes group continuation requires group_toolsets=[], including dry-run")
         parsed = urlsplit(self.ws_url)
         if (parsed.scheme not in ("ws", "wss") or not parsed.hostname or parsed.username or
                 parsed.password or parsed.query or parsed.fragment):

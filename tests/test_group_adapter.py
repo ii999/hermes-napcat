@@ -252,3 +252,74 @@ async def test_disconnect_cancels_background_group_processing(group_adapter):
     await asyncio.wait_for(entered.wait(), 1)
     await adapter.disconnect()
     assert cancelled.is_set()
+
+
+async def test_continuation_gateway_preserves_principal_and_disables_controls_and_media(group_adapter):
+    from hermes_napcat.engagement import Decision
+
+    adapter = group_adapter(proactive_assist={
+        'dry_run': False, 'quiet_window_ms': 100,
+        'classifier': {'enabled': True, 'model': 'test-classifier'},
+        'continuation': {'enabled': True},
+    })
+    adapter.groups.classifier.decide = AsyncMock(
+        return_value=Decision(True, .99, 'test', 'continue'))
+    adapter._attachments = AsyncMock(return_value=([], [], []))
+    entered, release = asyncio.Event(), asyncio.Event()
+    delivered = []
+
+    async def run(message):
+        delivered.append(message)
+        if not message.metadata['napcat_continuation']:
+            entered.set()
+            await release.wait()
+            adapter.transport.call.return_value = {'message_id': 1001}
+            assert (await adapter.send('group:300', 'initial answer')).success
+        else:
+            adapter.groups.before_send(Target.parse('group:300'))
+
+    background_gateway(adapter, run)
+    try:
+        await adapter._receive(event(1, text='分析一下', parts=[MENTION]))
+        await asyncio.wait_for(entered.wait(), 1)
+        await adapter._receive(event(2, text='补充一点'))
+        await asyncio.sleep(.15)
+        release.set()
+        await asyncio.wait_for(adapter.groups.wait_idle(), 2)
+        assert len(delivered) == 2
+        followup = delivered[-1]
+        assert followup.user_id == followup.source.user_id == '200'
+        assert followup.source.scope_id == '100' and followup.source.chat_id == 'group:300'
+        assert followup.metadata['napcat_proactive'] and not followup.allow_gateway_control
+        assert not followup.media_urls and 'initial answer' in followup.channel_context
+        adapter._attachments.assert_awaited_once()
+    finally:
+        release.set()
+        await adapter.disconnect()
+
+
+async def test_continuation_keeps_invitation_in_truncated_gateway_context(group_adapter):
+    from hermes_napcat.engagement import Decision
+
+    adapter = group_adapter(
+        allowed_users=['200', '201'],
+        group_context={'enabled': True, 'history_limit': 1},
+        proactive_assist={
+            'dry_run': False, 'quiet_window_ms': 100,
+            'classifier': {'enabled': True, 'model': 'test-classifier'},
+            'continuation': {'enabled': True},
+        })
+    adapter.groups.classifier.decide = AsyncMock(
+        return_value=Decision(True, .99, 'test', 'continue'))
+    try:
+        await adapter._receive(event(1, text='比较这两个数据库', parts=[MENTION]))
+        await adapter.groups.wait_idle()
+        await adapter._receive(event(2, user=201, text='哪个更快'))
+        await adapter.groups.wait_idle()
+        followup = adapter.handle_message.await_args.args[0]
+        rows = [json.loads(line) for line in followup.channel_context.splitlines()][1:]
+        assert [row['message_id'] for row in rows] == ['1']
+        assert followup.user_id == '201' and followup.metadata['napcat_continuation']
+        assert followup.reply_to_message_id is None and followup.reply_to_text is None
+    finally:
+        await adapter.disconnect()
