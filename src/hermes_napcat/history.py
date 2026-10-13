@@ -72,7 +72,7 @@ def _belongs(adapter: Any, target: Target, identifier: str, data: dict[str, Any]
 
 
 def _visible_author(adapter: Any, target: Target, author: str) -> bool:
-    return (author == adapter.settings.self_id or adapter.policy.authorized_user(author)
+    return (author == adapter.settings.self_id or adapter.policy.can_interact(author, target)
             or (target.kind == "group" and adapter.settings.group_context.enabled
                 and adapter.settings.group_context.observe_all_members))
 

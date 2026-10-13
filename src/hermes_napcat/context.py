@@ -126,7 +126,7 @@ class GroupContext:
             and incoming.target.id in self.settings.allowed_groups
             and (incoming.user_id == self.settings.self_id
                  or self.config.observe_all_members
-                 or self.policy.authorized_user(incoming.user_id))
+                 or self.policy.can_interact(incoming.user_id, incoming.target))
         )
 
     def room(self, address: str) -> RoomContext:

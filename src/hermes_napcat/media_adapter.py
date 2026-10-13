@@ -35,7 +35,7 @@ class MediaAdapterMixin:
 
     def _can_read_media_author(self, target: Target, author: str) -> bool:
         return self.policy.can_send(target) and (
-            author == self.settings.self_id or self.policy.authorized_user(author)
+            author == self.settings.self_id or self.policy.can_interact(author, target)
             or (target.kind == "group" and self.settings.group_context.enabled
                 and self.settings.group_context.observe_all_members))
 
@@ -107,7 +107,7 @@ class MediaAdapterMixin:
         return self.media_refs.remember(replace(node, target=target), node_path=node_path) if node else ()
 
     def _media_access(self, identifier: str, target: Target, requester_id: str, *, kind: str | None = None):
-        if (not self.settings.media.enabled or not self.policy.authorized_user(requester_id)
+        if (not self.settings.media.enabled or not self.policy.can_interact(requester_id, target)
                 or not self.policy.can_send(target)):
             raise PermissionError("current user or conversation cannot access media")
         item = self.media_refs.get(identifier, target)
@@ -246,7 +246,7 @@ class MediaAdapterMixin:
             return attempted >= config.max_attachments or remaining <= 0
 
         def current_access():
-            if (not self.policy.authorized_user(incoming.user_id)
+            if (not self.policy.can_interact(incoming.user_id, incoming.target)
                     or not self._can_read_media_author(incoming.target, incoming.user_id)):
                 raise PermissionError("current user or conversation cannot access media")
             if self.media_refs.is_recalled(incoming.target.address, incoming.message_id):

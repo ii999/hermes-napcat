@@ -79,6 +79,58 @@ async def test_group_file_notice_is_lazy_and_cannot_anchor_history(group_adapter
     await adapter.disconnect()
 
 
+@pytest.mark.parametrize("classifier_enabled", [False, True])
+async def test_invited_file_notice_stays_context_only_and_preserves_followup_budget(
+    group_adapter, classifier_enabled,
+):
+    from hermes_napcat.engagement import Decision
+    from test_file_notices import notice
+
+    adapter = group_adapter(
+        messages_per_minute=2,
+        media={"references": {"enabled": True}},
+        group_context={"enabled": True, "observe_untriggered": True,
+                       "history_backfill": False},
+        proactive_assist={
+            "dry_run": False, "quiet_window_ms": 100,
+            "continuation": {"enabled": True, "max_decisions_per_hour": 1},
+            "classifier": {"enabled": classifier_enabled, "model": "test-classifier"},
+        },
+    )
+    adapter.groups.classifier.decide = AsyncMock(
+        return_value=Decision(True, .99, "test", "continue"))
+    adapter._attachments = AsyncMock(return_value=([], [], []))
+    try:
+        await adapter._receive(event(1, text="Help me review this report", parts=[MENTION]))
+        await adapter.groups.wait_idle()
+        adapter.handle_message.assert_awaited_once()
+        adapter.handle_message.reset_mock()
+        adapter._attachments.reset_mock()
+
+        upload = notice()
+        await adapter._receive(upload)
+        await adapter._receive(upload)
+        await adapter.groups.wait_idle()
+        adapter.handle_message.assert_not_awaited()
+        adapter.groups.classifier.decide.assert_not_awaited()
+        adapter._attachments.assert_not_awaited()
+        adapter.transport.call.assert_not_awaited()
+
+        rows = adapter.groups.context.records("group:300", limit=10)
+        assert len(rows) == 2
+        refs = adapter.media_refs.for_message(Target.parse("group:300"), rows[-1].message_id)
+        assert len(refs) == 1 and refs[0].notice_only
+
+        await adapter._receive(event(2, text="Focus on the conclusion"))
+        await adapter.groups.wait_idle()
+        adapter.handle_message.assert_awaited_once()
+        followup = adapter.handle_message.await_args.args[0]
+        assert followup.metadata["napcat_continuation"]
+        assert refs[0].media_id in followup.channel_context
+    finally:
+        await adapter.disconnect()
+
+
 async def test_successful_outbound_is_observed_but_uncertain_delivery_is_not_retried(group_adapter):
     adapter = group_adapter()
     adapter.transport.call.side_effect = [{'message_id': 77}, DeliveryUncertain('ack lost')]
@@ -252,3 +304,74 @@ async def test_disconnect_cancels_background_group_processing(group_adapter):
     await asyncio.wait_for(entered.wait(), 1)
     await adapter.disconnect()
     assert cancelled.is_set()
+
+
+async def test_continuation_gateway_preserves_principal_and_disables_controls_and_media(group_adapter):
+    from hermes_napcat.engagement import Decision
+
+    adapter = group_adapter(proactive_assist={
+        'dry_run': False, 'quiet_window_ms': 100,
+        'classifier': {'enabled': True, 'model': 'test-classifier'},
+        'continuation': {'enabled': True},
+    })
+    adapter.groups.classifier.decide = AsyncMock(
+        return_value=Decision(True, .99, 'test', 'continue'))
+    adapter._attachments = AsyncMock(return_value=([], [], []))
+    entered, release = asyncio.Event(), asyncio.Event()
+    delivered = []
+
+    async def run(message):
+        delivered.append(message)
+        if not message.metadata['napcat_continuation']:
+            entered.set()
+            await release.wait()
+            adapter.transport.call.return_value = {'message_id': 1001}
+            assert (await adapter.send('group:300', 'initial answer')).success
+        else:
+            adapter.groups.before_send(Target.parse('group:300'))
+
+    background_gateway(adapter, run)
+    try:
+        await adapter._receive(event(1, text='分析一下', parts=[MENTION]))
+        await asyncio.wait_for(entered.wait(), 1)
+        await adapter._receive(event(2, text='补充一点'))
+        await asyncio.sleep(.15)
+        release.set()
+        await asyncio.wait_for(adapter.groups.wait_idle(), 2)
+        assert len(delivered) == 2
+        followup = delivered[-1]
+        assert followup.user_id == followup.source.user_id == '200'
+        assert followup.source.scope_id == '100' and followup.source.chat_id == 'group:300'
+        assert followup.metadata['napcat_proactive'] and not followup.allow_gateway_control
+        assert not followup.media_urls and 'initial answer' in followup.channel_context
+        adapter._attachments.assert_awaited_once()
+    finally:
+        release.set()
+        await adapter.disconnect()
+
+
+async def test_continuation_keeps_invitation_in_truncated_gateway_context(group_adapter):
+    from hermes_napcat.engagement import Decision
+
+    adapter = group_adapter(
+        allowed_users=['200', '201'],
+        group_context={'enabled': True, 'history_limit': 1},
+        proactive_assist={
+            'dry_run': False, 'quiet_window_ms': 100,
+            'classifier': {'enabled': True, 'model': 'test-classifier'},
+            'continuation': {'enabled': True},
+        })
+    adapter.groups.classifier.decide = AsyncMock(
+        return_value=Decision(True, .99, 'test', 'continue'))
+    try:
+        await adapter._receive(event(1, text='比较这两个数据库', parts=[MENTION]))
+        await adapter.groups.wait_idle()
+        await adapter._receive(event(2, user=201, text='哪个更快'))
+        await adapter.groups.wait_idle()
+        followup = adapter.handle_message.await_args.args[0]
+        rows = [json.loads(line) for line in followup.channel_context.splitlines()][1:]
+        assert [row['message_id'] for row in rows] == ['1']
+        assert followup.user_id == '201' and followup.metadata['napcat_continuation']
+        assert followup.reply_to_message_id is None and followup.reply_to_text is None
+    finally:
+        await adapter.disconnect()

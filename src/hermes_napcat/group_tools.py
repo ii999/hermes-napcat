@@ -12,7 +12,7 @@ from .tools import register_tools as register_base_tools
 @_tool_handler
 async def qq_get_recent_messages(args: dict[str, Any], **kwargs) -> dict[str, Any]:
     async def operation(adapter, target, session):
-        if not adapter.policy.authorized_user(session.user_id):
+        if not adapter.policy.can_interact(session.user_id, session.target):
             raise PermissionError("current user is not authorized to query conversation history")
         if target.kind == "private":
             page = await read_private_history(

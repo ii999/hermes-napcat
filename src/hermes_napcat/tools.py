@@ -117,7 +117,7 @@ def _action_key(tool: str, session: ToolSession, args: dict[str, Any]) -> str:
 async def _on_gateway(tool: str, args: dict[str, Any], operation, *, session_id: str = ""):
     session = _current_session(session_id)
     runner, adapter = _live_adapter(session.profile)
-    if not adapter.policy.authorized_user(session.user_id):
+    if not adapter.policy.can_interact(session.user_id, session.target):
         raise PermissionError("current user is not authorized to use QQ tools")
     enabled = adapter.settings.qq_tools.enabled
     is_read = tool in _READ_TOOLS

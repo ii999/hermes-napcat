@@ -1,10 +1,10 @@
 # 群聊上下文与参与策略
 
-本功能默认关闭。它扩展现有 NapCat 适配器；私聊、OneBot 传输、发送结果不确定时不重试、Hermes 用户鉴权和原有 QQ 工具权限继续生效。Hermes 继续管理 Agent、会话和持久记录，插件不修改 Hermes 核心，不另建会话数据库。
+群聊推荐对指定群开放全员对话、共享群会话，并开启背景观察和受邀续聊，未被叫到时的主动插话保持关闭。群聊配置示例已采用这组设置；省略扩展配置时仍保持关闭，续聊默认使用 Hermes 当前 Agent，无需新增模型接口。它扩展现有 NapCat 适配器；私聊、OneBot 传输、发送结果不确定时不重试、Hermes 用户鉴权和原有 QQ 工具权限继续生效。Hermes 继续管理 Agent、会话和持久记录，插件不修改 Hermes 核心，不另建会话数据库。
 
 ## 启用上下文
 
-把 `examples/group-chat.config.yaml` 合并到现有配置。保持 `NAPCAT_ALLOWED_USERS`、`allowed_groups` 和管理员配置。升级时必须同时更新 Python 包和目录插件入口：
+替换 `examples/group-chat.config.yaml` 中的示例群号，再合并到现有配置，沿用 Hermes 当前模型。示例推荐开启实际续聊，设置了 `continuation.enabled: true` 和 `dry_run: false`。保持 `NAPCAT_ALLOW_ALL_USERS=false`，保留私聊用户和管理员的 `NAPCAT_ALLOWED_USERS` 配置，并保留其他需要的 `allowed_groups` 项。升级时必须同时更新 Python 包和目录插件入口：
 
 ```sh
 uv run --no-project python scripts/install_plugin.py \
@@ -15,27 +15,33 @@ uv run --no-project python scripts/install_plugin.py \
 替换为自己的解释器与 profile 目录，随后重启 Gateway。只升级 wheel 可能留下旧 `plugin/tools.py`，导致无法发现新增工具。
 
 ```yaml
-group_sessions_per_user: true
+group_sessions_per_user: false
 gateway:
   platforms:
     napcat:
       extra:
+        allowed_groups: ["987654321"]
+        group_allowed_chats: ["group:987654321"]
         group_context:
           enabled: true
           observe_untriggered: true
-          observe_all_members: false
+          observe_all_members: true
           history_backfill: true
 ```
 
 配置位置是 `gateway.platforms.napcat.extra`；独立 CLI 的扁平配置直接使用 `group_context` 和 `proactive_assist`。
 
-`observe_all_members: false` 只观察原有白名单用户及机器人自己的消息。管理员明确设置为 `true` 后，插件才把允许群里的其他成员发言作为背景。这不会允许这些成员触发 Agent、运行命令或调用工具。群成员应知晓观察范围、数据用途和模型提供方；不要为了观察群聊开启全局 `NAPCAT_ALLOW_ALL_USERS`，那会扩大执行及私聊权限。
+`group_allowed_chats` 是独立的群成员授权列表，格式为 `group:<群号>`，其中每个群也必须在 `allowed_groups` 中。列出的群允许所有成员触发 Agent，并可在受邀窗口内接话；未列出的允许群仍检查用户白名单。默认列表为空，不接受 `*`、私聊目标或未被允许的群。配置通过 Hermes 原生的群会话授权检查，不伪造管理员身份，也不修改全局环境。授权配置变更后重启 Gateway。
+
+`NAPCAT_ALLOWED_USERS` 继续限制私聊；`NAPCAT_ALLOW_ALL_USERS` 应保持 `false`，开启它仍会全局放行。群全员授权不授予管理员权限：只有 `admins` 中明确配置且在用户白名单内的成员才能使用 Gateway 控制操作，QQ 群主或管理员标签不构成授权。群工具集仍默认为空；若另行启用工具，工具权限和跨会话管理员限制照常生效。
+
+`observe_all_members: false` 观察获准在该群对话的成员及机器人自己的消息，因此全员授权群也会观察所有成员。`true` 还会把其他允许群中的未授权成员发言作为背景，但不会让这些成员触发 Agent。推荐配置显式开启全员观察。群成员应知晓观察范围、共享会话、数据用途和模型提供方；不要为了群聊开放全局 `NAPCAT_ALLOW_ALL_USERS`。
 
 ## 群历史如何进入当前对话
 
-在线期间，插件先保存有界的群级观察记录，再判断是否需要回复。普通聊天不调用主模型、不下载历史附件。记录包括消息、作者、时间、@、引用、角色及附件类型，角色不赋予权限。开启短期媒体引用后可附带 `media_id`，但元数据不代表理解内容。群文件通知只按观察策略保留，不单独触发 Agent。
+在线期间，插件先保存有界的群级观察记录，再判断是否需要回复。未进入受邀续聊或主动参与判断的普通聊天不调用主模型，观察本身不下载历史附件。记录包括消息、作者、时间、@、引用、角色及附件类型，角色不赋予权限。开启短期媒体引用后可附带 `media_id`，但元数据不代表理解内容。群文件通知只按观察策略保留，不单独触发 Agent。
 
-在 `@机器人`、回复机器人或 `/ai` 触发时，插件把当前用户和原始请求放入正常 `MessageEvent`，把背景放入 Hermes 的 `channel_context`。插件保留 `source.user_id` 和机器人账号 scope，因此 `group_sessions_per_user: true` 的执行会话仍按用户隔离。公共群背景会在本轮向请求者的模型展示，个人私聊历史不会加入群背景。
+在 `@机器人`、回复机器人或 `/ai` 触发时，插件把当前用户和原始请求放入正常 `MessageEvent`，把背景放入 Hermes 的 `channel_context`。插件保留 `source.user_id` 和机器人账号 scope；推荐 `group_sessions_per_user: false`，让同一群成员共享 Hermes 群会话，各条消息仍保留真实作者。此项是 Hermes 顶层设置，也会影响其他平台的群会话。保持 `true` 时执行会话按用户隔离，但各成员仍可使用公共群背景并跨成员续聊。共享群会话不会把个人私聊历史加入群背景。
 
 冷启动、连接 epoch 变化、传输队列丢包、观察限流或关闭实时观察时，插件按需调用 `get_group_msg_history`。单次最多 `history_limit` 条，设置 `disable_get_url=true`、`parse_mult_msg=false`。它验证返回消息的群、作者、账号和时间，再与实时记录按消息 ID 去重。`message_id` 可为负数且不保证连续；代码不对它做递增或减法。分页使用来自已核验记录的锚点，遵循 NapCat 的短消息 ID 映射。
 
@@ -100,15 +106,59 @@ proactive_assist:
 
 未配置分类器时，插件只对“有人知道”“求助”“can anyone”等显式开放求助采用规则判断。规则决策的 1.0 是确定性标记，不是经过校准的语义置信度。它不提供完整话题理解，也不能保证区分玩笑、引用式求助或修辞问句。模型分类器启用后，可以评估更多疑问形式，并结合短期群背景决定是否插话。群聊处于快速互答时，新消息会使旧候选失效。
 
-`dry_run: true` 只记录结构化决策类别，不调用主 Agent、不发送消息；启用外部分类型模型后，dry-run 仍会调用该分类器并产生其费用。冷却和次数预算在 dry-run 中也生效。默认日志不写群聊原文或模型自由文本。
+对于未受邀的主动插话，`dry_run: true` 只记录结构化决策类别，不调用主 Agent、不发送消息；启用独立分类器后，dry-run 仍会调用该分类器并产生其费用。Hermes 原生续聊的 dry-run 会调用主 Agent，见下节。冷却和次数预算在 dry-run 中也生效。默认日志不写群聊原文或模型自由文本。
 
-`dry_run: false` 时，插件仅以获准发言人的真实身份发起普通会话，设置 `allow_gateway_control=False`，不伪造管理员或 internal 事件。**配置必须保持 `group_toolsets: []`**，以阻止主动会话执行 QQ 发图、文件写入、终端等副作用。需要群工具时，保留 dry-run 或关闭主动参与。自动背景读取不依赖模型工具，所以无工具模式仍可理解近期群聊。
+`dry_run: false` 时，插件仅以获准发言人的真实身份发起普通会话，设置 `allow_gateway_control=False`，不伪造管理员或 internal 事件。**配置必须保持 `group_toolsets: []`**，以阻止主动会话执行 QQ 发图、文件写入、终端等副作用。需要群工具时，关闭 Hermes 原生续聊，并保留主动插话 dry-run 或关闭主动参与。自动背景读取不依赖模型工具，所以无工具模式仍可理解近期群聊。
 
 插件在提交候选前检查群状态版本，并在发送第一段之前再次检查新消息与过期时间。过时主动回答不发送；第一段开始发送后，沿用原来的部分成功/不确定投递规则，避免取消已经开始的动作后再次发送。完整 Hermes 调度和任务上下文传播仍需实机验证。直接被叫到的请求不套用主动冷却，继续按原用户限流处理。
 
+## 被叫到后的连续对话
+
+`proactive_assist.continuation` 让机器人在被 @、用 `/ai` 叫到或被明确回复后，继续参与同一段群聊。窗口内的短答、补充、纠正和陈述句都可以交给 Hermes Agent 判断，不需要每次再 @。每条后续消息仍须通过当前群的授权规则，使用该条消息真实发言人的身份；一次邀请不会扩大其他群或私聊权限。全员授权群中，A 唤醒后，B、C 的相关发言也可以由 Hermes 判断并回复，不局限于最初触发者。
+
+下面是推荐的群聊配置，合并到 `gateway.platforms.napcat.extra`。默认推荐开启实际续聊，`proactive_assist.enabled: false` 关闭未被邀请时的主动插话。需要观察决策而暂不发送续聊回复时，可将 `dry_run` 改为 `true`；判断仍会接收上下文并产生模型调用费用。
+
+```yaml
+allowed_groups: ["987654321"]
+group_allowed_chats: ["group:987654321"]
+group_toolsets: []
+group_context:
+  enabled: true
+  observe_untriggered: true
+proactive_assist:
+  enabled: false
+  dry_run: false
+  quiet_window_ms: 2200
+  confidence_threshold: 0.90
+  continuation:
+    enabled: true
+    idle_seconds: 120
+    max_duration_seconds: 600
+    max_responses_per_hour: 30
+    max_decisions_per_hour: 120
+  classifier:
+    enabled: false
+```
+
+默认 `classifier.enabled: false` 时，插件通过 Hermes 已注册的消息处理器发起一次普通 Agent 调用，沿用当前模型、认证、会话和工具集限制。同一次调用结合邀请消息和近期群聊决定是否接话，并生成需要发送的正文；不另建 Agent，也不需要分类器 endpoint、model 或密钥。
+
+Agent 必须返回包含准确 `target_message_id`、`action` 和 `text` 的 JSON 对象。`reply` 携带非空正文；`listen` 表示相关话题暂不需要回复；`end` 关闭话题；`unrelated` 不延长窗口。后三者正文必须为空。字段、目标、长度或动作不合法时保持沉默，不把原始输出作为回复。模型的实际判断质量和格式遵循能力仍需实测。
+
+原生续聊包括 dry-run 都要求 `group_toolsets: []`。判断期间的进度、流式内容、错误提示及附件投递被发送门禁拦截，媒体在读取或上传前被拒绝。通过校验的最终正文由插件作为纯文本发送，不交给 Hermes 的附件指令解析或 TTS。结构化结果可能保留在 Hermes 会话记录中；插件不修改或删除主 Agent 的持久记录。即使决定旁听、不相关或 dry-run，这条路径也会消耗一次主 Agent 调用及用户限流额度。
+
+需要降低主模型判断成本时，可以显式配置独立分类器（见下节）。此时先由分类器返回是否响应和 `conversation_status`，仅获准回复后调用 Hermes。`continue` 可回复或旁听；`end`、`unrelated` 必须同时为 `respond: false`。缺少状态、状态矛盾、错误目标 ID、超时或低置信度不会触发续聊或延长窗口，也不会自动回退到主 Agent 判断。
+
+相关对话按消息在本地的接收时间续期；机器人自己的消息、无关闲聊、未授权发言和模型调用耗时不会续期。默认连续 120 秒没有获判为相关的新内容就停止；即使不断续期，同一次邀请也最多持续 600 秒。明确判断话题结束会立即关闭窗口，下一次被叫到才能重新开启。窗口过期按单调时钟检查，不发送“已冷却”提示；重启或断开适配器会清空状态，历史回填不能重新开启窗口。邀请消息被撤回或离开保留缓存也会关闭窗口。
+
+续聊有独立的每小时判断/回复预算，不受主动插话的 `cooldown_seconds` 限制，仍受原有用户限流、静默等待和跨群处理名额限制。同一成员连续发出的片段合并判断；生成回答时收到的补充消息会保留一个有界候选，等当前回答完成后结合新回答重新判断。新的真人发言或撤回会使旧候选失效，机器人发送及回显不会丢弃等待中的补充。@ 他人、引用他人或未知消息、命令和 `ignored_users` 中的账号不能触发续聊。控制命令会关闭续聊窗口，其他明确命令也不会开启窗口。
+
+实际续聊沿用主动参与的保护：`group_toolsets: []`、`allow_gateway_control=False`、不自动下载附件，发送第一段前复核上下文版本、邀请窗口和回复有效期。已开始发送后仍遵循部分成功/不确定投递规则，不自动重发。开启 `dry_run` 后，直接被叫到仍正常处理，后续自动判断不发送正文；默认仍调用 Hermes，启用独立分类器时则只调用分类器。窗口和预算照常变化。
+
+如果同时开启 `proactive_assist.enabled: true`，续聊关闭后，独立的主动插话规则仍可能响应开放求助。要保证冷却后一直等下一次被叫到，保持该开关为 `false`。配置修改后需重启 Gateway。
+
 ## 可选轻量模型分类器
 
-分类器使用独立、无工具的 Chat Completions 请求；不为每条群消息启动完整 Hermes Agent。不配置时不增加外部模型依赖。
+分类器默认关闭。开启后使用独立、无工具的 Chat Completions 请求作为前置筛选，只有决定回复才调用 Hermes；适合另有轻量模型的部署。未开启续聊时，省略分类器的主动插话只使用上述规则。
 
 ```yaml
 proactive_assist:
@@ -149,7 +199,9 @@ proactive_assist:
 
 ## 验收
 
-测试覆盖记录归属/时间/字节边界、实时与历史去重、观察权限与执行权限分离、引用核验、撤回、请求队列、冷却/预算、过时发送检查和本地 HTTP 分类器协议。适配器测试使用仓库的 Hermes doubles，不能代替实际 Hermes + QQ 联调。
+测试覆盖群全员授权与私聊隔离、跨群拒绝、真实发言人和管理员限制、群成员上下文/媒体/工具访问、记录归属/时间/字节边界、实时与历史去重、观察权限与执行权限分离、引用核验、撤回、请求队列、冷却/预算、过时发送检查和本地 HTTP 分类器协议。适配器测试使用仓库的 Hermes doubles，不能代替实际 Hermes + QQ 联调。
+
+续聊测试另外覆盖：只在受邀窗口内接收普通文字、保持当前发言人身份、相关旁听续期、话题结束、无关内容不续期、最长时限、重新唤醒、生成期间补充、独立预算、dry-run、分类器状态校验和发送前过期拦截。另有 Hermes handler 模拟测试覆盖结构化结果、纯文本投递、旁听/结束、无效输出拒绝、进度和延迟子任务拦截、跨目标发送、媒体预处理拦截、预算、dry-run 和不确定投递不重试。这些是模拟接口和本地 HTTP 协议验证，不代表真实模型已能准确判断群话题。
 
 实机验收应包含：其他群友讨论后突然 @、同名或改名成员、引用较旧消息、用户连发短句、真人抢先回答、分类器故障、断线后历史缺口、生成期间撤回及新消息、非管理员控制命令、其他机器人互答，以及正反向连接两种模式。开启实际主动回复前，先在 dry-run 中核对决策与群成员预期。
 

@@ -41,12 +41,16 @@ class Policy:
     def authorized_user(self, user: str) -> bool:
         return self.config.allow_all_users or user in self.config.allowed_users
 
+    def can_interact(self, user: str, target: Target) -> bool:
+        """Authorize a principal in one conversation without granting private-chat access."""
+        return self.can_send(target) and (
+            self.authorized_user(user)
+            or (target.kind == "group" and target.address in self.config.group_allowed_chats))
+
     def can_receive(self, incoming: Incoming) -> bool:
         if incoming.self_id != self.config.self_id or incoming.user_id == incoming.self_id:
             return False
-        if not self.authorized_user(incoming.user_id):
-            return False
-        return incoming.target.kind == "private" or incoming.target.id in self.config.allowed_groups
+        return self.can_interact(incoming.user_id, incoming.target)
 
     def can_send(self, target: Target) -> bool:
         if target.kind == "private":

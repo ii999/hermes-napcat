@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -34,8 +35,14 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
     supports_code_blocks = False
 
     def __init__(self, config: PlatformConfig, *, receive_events: bool = True):
+        settings = settings_from_platform(config)
+        # Hermes consumes this native grant from the live adapter, using canonical chat IDs
+        # and a list (not a tuple). Keep caller config and other profiles independent.
+        config = copy.copy(config)
+        config.extra = {**(getattr(config, "extra", None) or {}),
+                        "group_allowed_chats": list(settings.group_allowed_chats)}
         super().__init__(config, Platform("napcat"))
-        self.settings = settings_from_platform(config)
+        self.settings = settings
         self.policy = Policy(self.settings)
         self.transport = OneBotTransport(self.settings, self._receive if receive_events else self._ignore)
         self.media: MediaStore | None = None

@@ -1,16 +1,20 @@
-# 合并到现有配置；不要覆盖模型、密钥、白名单和其他平台配置。
-group_sessions_per_user: true
+# Merge into existing configuration; retain models, secrets and other platform settings.
+# This Hermes setting applies to group sessions across platforms.
+group_sessions_per_user: false
 gateway:
   platforms:
     napcat:
       extra:
-        # 仍需配置 allowed_groups / NAPCAT_ALLOWED_USERS。
+        # Replace the example group ID; retain any other allowed_groups entries.
+        # Keep NAPCAT_ALLOW_ALL_USERS=false and NAPCAT_ALLOWED_USERS for private chats/admins.
+        allowed_groups: ['987654321']
+        group_allowed_chats: ['group:987654321']
         group_toolsets: []
         group_context:
           enabled: true
           observe_untriggered: true
-          # 群成员知晓数据用途后才能开启；不会扩大 Agent/工具调用权限。
-          observe_all_members: false
+          # Observe all members; conversation authorization follows the group grants above.
+          observe_all_members: true
           live_buffer_messages: 200
           history_limit: 50
           history_window_seconds: 1800
@@ -20,8 +24,9 @@ gateway:
           backfill_cooldown_seconds: 30
           stop_at_last_bot_message: false
         proactive_assist:
-          enabled: true
-          dry_run: true
+          # Recommended: continue invited conversations without unsolicited replies.
+          enabled: false
+          dry_run: false
           quiet_window_ms: 2200
           burst_window_seconds: 30
           cooldown_seconds: 120
@@ -29,8 +34,12 @@ gateway:
           max_decisions_per_hour: 30
           confidence_threshold: 0.90
           ignored_users: []
+          continuation:
+            enabled: true
+            idle_seconds: 120
+            max_duration_seconds: 600
+            max_responses_per_hour: 30
+            max_decisions_per_hour: 120
           classifier:
+            # Use the existing Hermes Agent; an independent classifier is optional.
             enabled: false
-            base_url: http://127.0.0.1:8000/v1
-            model: ''
-            api_key_env: NAPCAT_CLASSIFIER_API_KEY
