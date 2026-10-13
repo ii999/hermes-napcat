@@ -1,7 +1,7 @@
 name: napcat
 label: NapCat / QQ
 kind: platform
-version: 0.2.0
+version: 0.3.0
 description: OneBot v11 full-duplex WebSocket adapter for NapCatQQ
 author: ii999
 provides_tools:
