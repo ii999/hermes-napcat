@@ -195,7 +195,8 @@ class GroupChatController:
             else:
                 self.context.room(address).gap = True
                 self.stats["observation_dropped"] += 1
-        if not authorized:
+        # File uploads are observation-only, including during an invited conversation.
+        if not authorized or incoming.raw.get("_napcat_file_notice") is True:
             return
         if (direct is not None and incoming.user_id in self.settings.admins
                 and self.is_control_reply(incoming, direct)):

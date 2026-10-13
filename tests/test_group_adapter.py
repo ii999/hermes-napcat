@@ -79,6 +79,58 @@ async def test_group_file_notice_is_lazy_and_cannot_anchor_history(group_adapter
     await adapter.disconnect()
 
 
+@pytest.mark.parametrize("classifier_enabled", [False, True])
+async def test_invited_file_notice_stays_context_only_and_preserves_followup_budget(
+    group_adapter, classifier_enabled,
+):
+    from hermes_napcat.engagement import Decision
+    from test_file_notices import notice
+
+    adapter = group_adapter(
+        messages_per_minute=2,
+        media={"references": {"enabled": True}},
+        group_context={"enabled": True, "observe_untriggered": True,
+                       "history_backfill": False},
+        proactive_assist={
+            "dry_run": False, "quiet_window_ms": 100,
+            "continuation": {"enabled": True, "max_decisions_per_hour": 1},
+            "classifier": {"enabled": classifier_enabled, "model": "test-classifier"},
+        },
+    )
+    adapter.groups.classifier.decide = AsyncMock(
+        return_value=Decision(True, .99, "test", "continue"))
+    adapter._attachments = AsyncMock(return_value=([], [], []))
+    try:
+        await adapter._receive(event(1, text="Help me review this report", parts=[MENTION]))
+        await adapter.groups.wait_idle()
+        adapter.handle_message.assert_awaited_once()
+        adapter.handle_message.reset_mock()
+        adapter._attachments.reset_mock()
+
+        upload = notice()
+        await adapter._receive(upload)
+        await adapter._receive(upload)
+        await adapter.groups.wait_idle()
+        adapter.handle_message.assert_not_awaited()
+        adapter.groups.classifier.decide.assert_not_awaited()
+        adapter._attachments.assert_not_awaited()
+        adapter.transport.call.assert_not_awaited()
+
+        rows = adapter.groups.context.records("group:300", limit=10)
+        assert len(rows) == 2
+        refs = adapter.media_refs.for_message(Target.parse("group:300"), rows[-1].message_id)
+        assert len(refs) == 1 and refs[0].notice_only
+
+        await adapter._receive(event(2, text="Focus on the conclusion"))
+        await adapter.groups.wait_idle()
+        adapter.handle_message.assert_awaited_once()
+        followup = adapter.handle_message.await_args.args[0]
+        assert followup.metadata["napcat_continuation"]
+        assert refs[0].media_id in followup.channel_context
+    finally:
+        await adapter.disconnect()
+
+
 async def test_successful_outbound_is_observed_but_uncertain_delivery_is_not_retried(group_adapter):
     adapter = group_adapter()
     adapter.transport.call.side_effect = [{'message_id': 77}, DeliveryUncertain('ack lost')]
