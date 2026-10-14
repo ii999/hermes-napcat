@@ -26,6 +26,7 @@ from .protocol import (
     split_text, text_segments,
 )
 from .transport import DeliveryUncertain, OneBotError, OneBotTransport
+from .tool_policy import bind_group_tool_scope, group_tool_scope
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +53,19 @@ class NapCatAdapter(MediaAdapterMixin, BasePlatformAdapter):
         self._file_notices = FileNotices(self.settings)
         self._send_gate = asyncio.Lock()
         self._agent_actions: dict[str, asyncio.Task[Any]] = {}
+
+    def set_message_handler(self, handler: Callable[[MessageEvent], Awaitable[str | None]]) -> None:
+        async def wrapped(event: MessageEvent) -> str | None:
+            with group_tool_scope(self, event.source):
+                return await handler(event)
+
+        super().set_message_handler(wrapped)
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        # Hermes queue replacements reuse the prior handler task. A copied scope
+        # must be rebound to the actual event before any provider or tool work.
+        bind_group_tool_scope(self, event.source)
+        await super().on_processing_start(event)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if self.transport.running:

@@ -16,7 +16,8 @@ from typing import Any
 from .config import Settings
 from .context import GroupContext, GroupMessage
 from .file_notices import FileNotices
-from .engagement import ContinuationResult, ParticipationClassifier, WindowBudget, candidate_from_tail
+from .continuation import FollowupBatch, FollowupDecision, FollowupExecution, GroupContinuation, Invitation
+from .engagement import ParticipationClassifier, WindowBudget, candidate_from_tail
 from .media_refs import MediaReferences
 from .policy import Policy, RecentIDs
 from .protocol import Incoming, Target, message_id
@@ -35,13 +36,7 @@ class GroupTurn:
     ticket: ProactiveTicket | None = None
     inline: bool = False
     continuation: bool = False
-
-
-@dataclass
-class _Conversation:
-    invitation_id: str
-    deadline: float
-    expires: float
+    followup: FollowupExecution | None = None
 
 
 @dataclass
@@ -50,10 +45,6 @@ class ProactiveTicket:
     revision: int
     expires: float
     first_send_started: bool = False
-    conversation: _Conversation | None = None
-    agent_decision: bool = False
-    received_at: float = 0
-    decision_processed: bool = False
 
 
 class GroupChatController:
@@ -64,6 +55,7 @@ class GroupChatController:
                  classifier_key: str = "",
                  media_refs: MediaReferences | None = None,
                  file_notices: FileNotices | None = None,
+                 decide_followup: Callable[[FollowupBatch, Incoming], Awaitable[FollowupDecision]] | None = None,
                  is_control_reply: Callable[[Incoming, str], bool] = (
                      lambda incoming, text: text.lstrip().startswith("/"))):
         self.settings, self.policy, self.call, self.dispatch = settings, policy, call, dispatch
@@ -74,6 +66,7 @@ class GroupChatController:
         self.is_control_reply = is_control_reply
         self.file_notices = file_notices
         self.classifier = ParticipationClassifier(self.proactive.classifier, classifier_key)
+        self._native_decide_followup = decide_followup
         self.seen = RecentIDs(settings.dedup_capacity, settings.dedup_ttl)
         self._negative_quotes = RecentIDs(settings.dedup_capacity, 30)
         self._observe_budget = WindowBudget(self.config.observation_messages_per_minute, 60,
@@ -81,15 +74,12 @@ class GroupChatController:
         self._read_budget = WindowBudget(30, 60, self.config.max_groups)
         self._decisions = WindowBudget(self.proactive.max_decisions_per_hour, 3600, self.config.max_groups)
         self._responses = WindowBudget(self.proactive.max_responses_per_hour, 3600, self.config.max_groups)
-        self._followup_decisions = WindowBudget(
-            self.continuation.max_decisions_per_hour, 3600, self.config.max_groups)
-        self._followup_responses = WindowBudget(
-            self.continuation.max_responses_per_hour, 3600, self.config.max_groups)
-        self._conversations: OrderedDict[str, _Conversation] = OrderedDict()
         self._cooldowns: OrderedDict[str, float] = OrderedDict()
         self._fetch_state: OrderedDict[str, tuple[tuple[int, int], float]] = OrderedDict()
         self._fetches: dict[str, asyncio.Task] = {}
-        self._queues: dict[str, deque[Incoming]] = {}
+        self._queues: dict[str, deque[tuple[Incoming, Invitation | None, int]]] = {}
+        self._request_serial = 0
+        self._latest_invitation: dict[str, int] = {}
         self._workers: dict[str, asyncio.Task] = {}
         self._timers: dict[str, asyncio.Task] = {}
         self._controls: set[asyncio.Task] = set()
@@ -100,6 +90,7 @@ class GroupChatController:
         self._turn_locks = {f"group:{group}": asyncio.Lock() for group in settings.allowed_groups}
         self._classifier_slot = asyncio.Semaphore(1)
         self._ticket: ContextVar[ProactiveTicket | None] = ContextVar("napcat_proactive", default=None)
+        self._turn: ContextVar[GroupTurn | None] = ContextVar("napcat_group_turn", default=None)
         self.stats = {key: 0 for key in (
             "observed", "observation_dropped", "queue_dropped", "history_errors",
             "decisions", "classifier_errors", "dry_run", "proactive_dispatched",
@@ -107,6 +98,9 @@ class GroupChatController:
             "continuation_dispatched", "conversations_closed",
             "agent_decision_errors", "continuation_send_errors",
         )}
+        self.followups = GroupContinuation(
+            settings, policy, self.context, locks=self._turn_locks,
+            decide=self._decide_followup, execute=self._execute_followup, stats=self.stats)
 
     @property
     def closed(self) -> bool:
@@ -123,20 +117,6 @@ class GroupChatController:
         if task is not None and task is not asyncio.current_task():
             task.cancel()
 
-    def _conversation(self, address: str) -> _Conversation | None:
-        state = self._conversations.get(address)
-        if state is not None and (
-            time.monotonic() >= state.expires
-            or self.context.lookup(address, state.invitation_id) is None
-        ):
-            self._end_conversation(address)
-            return None
-        return state
-
-    def _end_conversation(self, address: str) -> None:
-        if self._conversations.pop(address, None) is not None:
-            self.stats["conversations_closed"] += 1
-
     async def receive(self, raw: dict[str, Any]) -> None:
         if self._closed or not self.config.enabled:
             return
@@ -152,7 +132,7 @@ class GroupChatController:
             if target.id in self.settings.allowed_groups:
                 self.context.recall(target.address, identifier)
                 self._cancel_timer(target.address)
-                self._conversation(target.address)
+                self.followups.recall(target.address, identifier)
                 self.stats["recalls"] += 1
             return
         try:
@@ -200,20 +180,23 @@ class GroupChatController:
             return
         if (direct is not None and incoming.user_id in self.settings.admins
                 and self.is_control_reply(incoming, direct)):
-            self._end_conversation(address)
+            self._request_serial += 1
+            self._latest_invitation[address] = self._request_serial
+            self.followups.end(address)
             # Do not queue /stop behind a slow model turn. Preserve the genuine principal.
             if self.policy.rate_allowed(incoming) and len(self._controls) < self.config.max_pending_messages:
                 task = asyncio.create_task(self._dispatch_control(GroupTurn(incoming, direct, inline=True)))
                 self._controls.add(task)
                 task.add_done_callback(self._controls.discard)
             return
+        quote = self.context.lookup(address, incoming.reply_to) if incoming.reply_to else None
+        own_reply = bool(quote and quote.own) or self.policy.own.contains((address, incoming.reply_to))
+        if (direct is None and not own_reply and self.continuation.enabled
+                and self.followups.offer(incoming)):
+            return
         if direct is not None or reply_candidate:
             self._enqueue(incoming)
-        elif observe and (self.proactive.enabled or self.continuation.enabled):
-            continuing = self.continuation.enabled and (
-                self._conversation(address) is not None or address in self._workers)
-            if not continuing and not self.proactive.enabled:
-                return
+        elif observe and self.proactive.enabled:
             # Timers retain only bounded text and identity, never remote URLs or a raw WS payload.
             record = self.context.lookup(address, incoming.message_id)
             if record is None:
@@ -221,7 +204,7 @@ class GroupChatController:
             bounded = replace(incoming, text=record.text, segments=[],
                               raw={"time": record.timestamp})
             self._timers[address] = asyncio.create_task(
-                self._after_quiet(bounded, continuing=continuing, received_at=time.monotonic()))
+                self._after_quiet(bounded))
 
     async def _dispatch_control(self, turn: GroupTurn) -> None:
         try:
@@ -240,7 +223,17 @@ class GroupChatController:
             self.context.room(address).gap = True
             log.warning("Group turn queue full; addressed message was not dispatched")
             return
-        self._queues.setdefault(address, deque()).append(incoming)
+        invitation = None
+        self._request_serial += 1
+        order = self._request_serial
+        direct = self.policy.trigger(incoming)
+        if direct is not None and self.continuation.enabled:
+            self._latest_invitation[address] = order
+            if direct.lstrip().startswith("/"):
+                self.followups.end(address)
+            else:
+                invitation = self.followups.start(incoming)
+        self._queues.setdefault(address, deque()).append((incoming, invitation, order))
         self._pending += 1
         if address not in self._workers:
             self._workers[address] = asyncio.create_task(self._drain(address))
@@ -249,10 +242,10 @@ class GroupChatController:
         try:
             queue = self._queues[address]
             while queue and not self._closed:
-                incoming = queue.popleft()
+                incoming, invitation, order = queue.popleft()
                 self._pending -= 1
                 try:
-                    await self._addressed(incoming)
+                    await self._addressed(incoming, invitation, order)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -360,10 +353,23 @@ class GroupChatController:
         task.add_done_callback(finished)
         await asyncio.shield(task)
 
-    async def _addressed(self, incoming: Incoming) -> None:
+    async def _addressed(self, incoming: Incoming, invitation: Invitation | None, order: int) -> None:
+        failed = True
+        dispatched = False
+        try:
+            dispatched = await self._addressed_turn(incoming, invitation, order)
+            failed = False
+        finally:
+            if invitation is not None:
+                if not failed and not dispatched:
+                    self.followups.discard(incoming.target.address, invitation)
+                else:
+                    self.followups.initial_finished(invitation, failed=failed)
+
+    async def _addressed_turn(self, incoming: Incoming, invitation: Invitation | None, order: int) -> bool:
         address = incoming.target.address
         if self.context.is_recalled(address, incoming.message_id):
-            return
+            return False
         text = self.policy.trigger(incoming)
         quote = None
         own_reply = incoming.reply_to is not None and self.policy.own.contains((address, incoming.reply_to))
@@ -372,7 +378,7 @@ class GroupChatController:
             own_reply = own_reply or bool(quote and quote.own)
             text = self.policy.trigger(incoming, own_reply)
         if text is None or not self.policy.rate_allowed(incoming):
-            return
+            return False
         self._bounded_set(self._cooldowns, address, time.monotonic())
         if not self.continuation.enabled:
             self._cancel_timer(address)
@@ -381,42 +387,55 @@ class GroupChatController:
             quote = quote or await self._quote(incoming)
             own_reply = own_reply or bool(quote and quote.own)
             if self.context.is_recalled(address, incoming.message_id):
-                return
+                return False
             context, _, _ = self.context.render(address, current=incoming, quote=quote)
-            conversation = None
-            if text.lstrip().startswith("/"):
-                self._end_conversation(address)
-            elif self.continuation.enabled:
-                now = time.monotonic()
-                conversation = _Conversation(
-                    incoming.message_id, now + self.continuation.max_duration_seconds,
-                    now + self.continuation.idle_seconds)
-                self._bounded_set(self._conversations, address, conversation)
+            if text.lstrip().startswith("/") and order >= self._latest_invitation.get(address, 0):
+                self._latest_invitation[address] = order
+                self.followups.end(address)
+            late_invitation = (self.followups.start(incoming)
+                               if self.continuation.enabled and invitation is None
+                               and order > self._latest_invitation.get(address, 0)
+                               and not text.lstrip().startswith("/") else None)
+            if late_invitation is not None:
+                self._latest_invitation[address] = order
+            failed = True
             try:
                 await self.dispatch(GroupTurn(incoming, text, own_reply, context, quote))
-            except BaseException:
-                if conversation is not None and self._conversations.get(address) is conversation:
-                    self._end_conversation(address)
-                raise
+                failed = False
+            finally:
+                if late_invitation is not None:
+                    self.followups.initial_finished(late_invitation, failed=failed)
+            return True
 
-    async def _after_quiet(self, incoming: Incoming, *, continuing: bool = False,
-                           received_at: float | None = None) -> None:
+    async def _decide_followup(self, batch: FollowupBatch, incoming: Incoming) -> FollowupDecision:
+        async with self._classifier_slot:
+            if self.proactive.classifier.enabled:
+                return await self.classifier.decide_followup(batch)
+            if self._native_decide_followup is None:
+                raise RuntimeError("Hermes continuation admission is unavailable")
+            return await self._native_decide_followup(batch, incoming)
+
+    async def _execute_followup(self, execution: FollowupExecution) -> None:
+        async with self._model_slots:
+            if self._closed:
+                return
+            turn = GroupTurn(execution.incoming, execution.incoming.text,
+                             context=execution.task_context(), continuation=True, followup=execution)
+            token = self._turn.set(turn)
+            try:
+                await self.dispatch(turn)
+            finally:
+                self._turn.reset(token)
+
+    async def _after_quiet(self, incoming: Incoming) -> None:
         address = incoming.target.address
-        received_at = time.monotonic() if received_at is None else received_at
         current_task = asyncio.current_task()
         try:
             await asyncio.sleep(self.proactive.quiet_window_ms / 1000)
-            if self._closed:
-                return
-            if continuing:
-                worker = self._workers.get(address)
-                if worker is not None:
-                    # Cancelling a pending candidate must never cancel the addressed turn.
-                    await asyncio.shield(worker)
-            elif address in self._workers or self._turn_locks[address].locked():
+            if self._closed or address in self._workers or self._turn_locks[address].locked():
                 return
             async with self._turn_locks[address]:
-                await self._evaluate(incoming, continuing=continuing, received_at=received_at)
+                await self._evaluate(incoming)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -426,51 +445,24 @@ class GroupChatController:
             if self._timers.get(address) is current_task:
                 self._timers.pop(address, None)
 
-    async def _evaluate(self, incoming: Incoming, *, continuing: bool,
-                        received_at: float) -> None:
+    async def _evaluate(self, incoming: Incoming) -> None:
         address = incoming.target.address
-        conversation = self._conversation(address) if continuing else None
-        if continuing and conversation is None:
-            return  # An expired invitation never falls back to unsolicited participation.
-        if not continuing:
-            last = self._cooldowns.get(address, float("-inf"))
-            if time.monotonic() - last < self.proactive.cooldown_seconds:
-                return
+        last = self._cooldowns.get(address, float("-inf"))
+        if time.monotonic() - last < self.proactive.cooldown_seconds:
+            return
         revision = self.context.room(address).revision
-        rows = self.context.records(address, limit=(self.config.live_buffer_messages
-                                                   if continuing else self.config.history_limit))
-        invitation = None
-        if conversation is not None:
-            start = next((i for i, row in enumerate(rows)
-                          if row.message_id == conversation.invitation_id), None)
-            end = next((i for i, row in enumerate(rows)
-                        if row.message_id == incoming.message_id), None)
-            if start is None or end is None or end <= start:
-                return
-            invitation = rows[start]
-            rows = rows[start:end + 1]
-        candidate = candidate_from_tail(
-            rows, self.proactive, self.settings.self_id,
-            conversation_start_id=conversation.invitation_id if conversation else None)
-        decisions = self._followup_decisions if continuing else self._decisions
-        responses = self._followup_responses if continuing else self._responses
+        rows = self.context.records(address, limit=self.config.history_limit)
+        candidate = candidate_from_tail(rows, self.proactive, self.settings.self_id)
         if (candidate is None or candidate.message_id != incoming.message_id
-                or not self.policy.can_receive(incoming) or not decisions.take(address)):
+                or not self.policy.can_receive(incoming) or not self._decisions.take(address)):
             return
 
         def fresh() -> bool:
             return (not self._closed and revision == self.context.room(address).revision
-                    and not self.context.is_recalled(address, incoming.message_id)
-                    and (conversation is None or self._conversation(address) is conversation))
+                    and not self.context.is_recalled(address, incoming.message_id))
 
         await self.ensure_history(incoming.target, incoming.message_id)
-        if continuing and not self.proactive.classifier.enabled:
-            if fresh() and self.policy.rate_allowed(incoming):
-                self.stats["decisions"] += 1
-                await self._dispatch_candidate(incoming, candidate.text, revision, conversation,
-                                               invitation, received_at, agent_decision=True)
-            return
-        context, _, _ = self.context.render(address, quote=invitation)
+        context, _, _ = self.context.render(address)
         async with self._classifier_slot:
             if not fresh():
                 return
@@ -479,57 +471,30 @@ class GroupChatController:
         if not fresh():
             self.stats["stale_suppressed"] += 1
             return
-        if decision.confidence < self.proactive.confidence_threshold:
-            return
-        if conversation is not None:
-            if decision.conversation_status == "end":
-                self._end_conversation(address)
-                return
-            if decision.conversation_status != "continue":
-                return
-            conversation.expires = min(
-                conversation.deadline, received_at + self.continuation.idle_seconds)
-        if not decision.respond or not responses.take(address):
+        if (decision.confidence < self.proactive.confidence_threshold
+                or not decision.respond or not self._responses.take(address)):
             return
         self._bounded_set(self._cooldowns, address, time.monotonic())
         if self.proactive.dry_run:
             self.stats["dry_run"] += 1
-            log.info("Proactive dry-run: would respond (reason=%s, continuation=%s)",
-                     decision.reason, continuing)
             return
         if not self.policy.rate_allowed(incoming):
             return
-        await self._dispatch_candidate(incoming, candidate.text, revision, conversation,
-                                       invitation, received_at)
-
-    async def _dispatch_candidate(self, incoming: Incoming, text: str, revision: int,
-                                  conversation: _Conversation | None,
-                                  invitation: GroupMessage | None, received_at: float, *,
-                                  agent_decision: bool = False) -> None:
-        address = incoming.target.address
-        continuing = conversation is not None
         async with self._model_slots:
-            if (self._closed or self.context.room(address).revision != revision
-                    or (conversation is not None and self._conversation(address) is not conversation)):
+            if not fresh():
                 return
-            expires = time.monotonic() + self.proactive.max_reply_age_seconds
-            if conversation is not None:
-                expires = min(expires, conversation.expires)
-            ticket = ProactiveTicket(address, revision, expires, conversation=conversation,
-                                     agent_decision=agent_decision, received_at=received_at)
+            ticket = ProactiveTicket(address, revision,
+                                     time.monotonic() + self.proactive.max_reply_age_seconds)
             token = self._ticket.set(ticket)
             current_task = asyncio.current_task()
             try:
-                context, _, _ = self.context.render(
-                    address, current=None if continuing else incoming, quote=invitation)
+                context, _, _ = self.context.render(address, current=incoming)
                 self.stats["proactive_dispatched"] += 1
-                self.stats["continuation_dispatched"] += int(continuing)
                 if self._timers.get(address) is current_task:
                     self._timers.pop(address, None)
                 self._proactive_runs.add(current_task)
-                await self.dispatch(GroupTurn(incoming, text, context=context,
-                                              proactive=True, ticket=ticket,
-                                              continuation=continuing))
+                await self.dispatch(GroupTurn(incoming, candidate.text, context=context,
+                                              proactive=True, ticket=ticket))
             finally:
                 self._ticket.reset(token)
                 self._proactive_runs.discard(current_task)
@@ -537,47 +502,21 @@ class GroupChatController:
     def activate_turn(self, turn: GroupTurn | None) -> None:
         """Bind the actual host processing task, including tasks drained from its queue."""
         self._ticket.set(turn.ticket if turn is not None else None)
+        self._turn.set(turn)
 
     @property
-    def agent_deciding(self) -> bool:
-        ticket = self._ticket.get()
-        return ticket is not None and ticket.agent_decision
-
-    def finish_agent_decision(self, ticket: ProactiveTicket, result: ContinuationResult) -> bool:
-        """Apply a fresh, single-use decision; return whether its text may be delivered."""
-        if (not ticket.agent_decision or ticket.decision_processed
-                or self._ticket.get() is not ticket):
-            return False
-        ticket.decision_processed = True
-        self._check_fresh(ticket)
-        conversation = ticket.conversation
-        if result.action == "end":
-            self._end_conversation(ticket.address)
-        elif result.action in ("reply", "listen") and conversation is not None:
-            conversation.expires = min(
-                conversation.deadline, ticket.received_at + self.continuation.idle_seconds)
-        if result.action != "reply" or not self._followup_responses.take(ticket.address):
-            return False
-        self._bounded_set(self._cooldowns, ticket.address, time.monotonic())
-        if self.proactive.dry_run:
-            self.stats["dry_run"] += 1
-            log.info("Continuation dry-run: Hermes would reply")
-            return False
-        return True
+    def cross_chat_allowed(self) -> bool:
+        turn = self._turn.get()
+        return turn is None or turn.followup is None or turn.followup.cross_chat_allowed
 
     def _check_fresh(self, ticket: ProactiveTicket) -> None:
         if (self._closed or time.monotonic() >= ticket.expires
-                or self.context.room(ticket.address).revision != ticket.revision
-                or (ticket.conversation is not None
-                    and self._conversation(ticket.address) is not ticket.conversation)):
+                or self.context.room(ticket.address).revision != ticket.revision):
             self.stats["stale_suppressed"] += 1
             raise PermissionError("proactive response is stale; do not retry")
 
-    def before_send(self, target: Target, *, approved: ProactiveTicket | None = None) -> None:
+    def before_send(self, target: Target) -> None:
         ticket = self._ticket.get()
-        if ticket is not None and ticket.agent_decision and (
-                ticket is not approved or target.address != ticket.address):
-            raise PermissionError("continuation output is not an approved final reply; do not retry")
         if ticket is None or ticket.address != target.address or ticket.first_send_started:
             return
         self._check_fresh(ticket)
@@ -634,6 +573,7 @@ class GroupChatController:
         tasks = [*self._workers.values(), *self._timers.values(), *self._controls, *self._proactive_runs]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        await self.followups.wait_idle()
 
     async def close(self) -> None:
         self._closed = True
@@ -649,7 +589,7 @@ class GroupChatController:
         self._controls.clear()
         self._proactive_runs.clear()
         self._queues.clear()
-        self._conversations.clear()
         self._pending = 0
+        await self.followups.close()
         await self.classifier.close()
         self.context.clear()

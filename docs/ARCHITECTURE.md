@@ -6,7 +6,7 @@
 
 `adapter.py` 构造 Hermes 事件及受控动作；`media_understanding.py` 在主机边界调用已安装的 Hermes handler；`tools.py`/`group_tools.py` 绑定当前 session 和读写工具；`outbound.py` 预检主机组合投递；`plugin.py` 注册平台/投递钩子；`cli.py` 提供诊断。协议、存储、流式传输和历史模块不导入 Hermes。
 
-可选群聊层由 `group_adapter.py` 扩展基础适配器。`context.py` 保存有界观察记录，`group_chat.py` 负责观察、回填和调度，`engagement.py` 负责规则/无工具模型参与判断，`group_tools.py` 注册基础工具及近期群消息读取工具。后四个模块中的协议和调度逻辑不导入 Hermes；只有适配器和工具执行边界使用主机接口。
+可选群聊层由 `group_adapter.py` 扩展基础适配器。`context.py` 保存有界观察记录，`group_chat.py` 负责观察、回填和调度，`engagement.py` 负责规则/独立无工具模型参与判断，`continuation.py` 负责邀请及有序补充批次，`group_tools.py` 注册基础工具及近期群消息读取工具。后四个模块中的协议和调度逻辑不导入 Hermes；只有适配器和工具执行边界使用主机接口。
 
 目录插件 `plugin/__init__.py` 暴露 `register(ctx)`，`plugin/tools.py` 为 Hermes 的延迟平台加载器提供独立 `register_tools(ctx)`。实现代码装入 Hermes 的 Python 环境。工具发现不会导入 adapter 或连接 QQ；平台加载时重复注册采用 Hermes 的同一插件作用域。
 
@@ -18,7 +18,7 @@ OneBot reader 先区分事件和 API 响应。连接后调用 `get_login_info` �
 
 插件随后处理允许的媒体并调用 `build_source()`，保留用户身份、聊天类型、消息 ID 和账号 scope 元数据，通过 `handle_message()` 交给 Hermes。用户/群 ID 不复用同一裸数字地址。实际会话键、profile 路由、memory、模型调用及 cron 调度由 Hermes 负责。多个机器人账号应分配独立 profile；不依赖未验证的跨账号 session-key 推断。
 
-网关鉴权仍然启用。插件不会设置 `internal=True` 或伪造 `role_authorized=True`。非管理员事件设置 `allow_gateway_control=False`。群聊工具集默认用空列表覆盖；私聊使用 Hermes 平台工具配置。
+网关鉴权仍然启用。插件不会设置 `internal=True` 或伪造 `role_authorized=True`。非管理员事件设置 `allow_gateway_control=False`。群聊工具集默认为空；`tool_policy.py` 通过 Hermes 公共 middleware 和工具 hook 约束实际请求与执行，防止空覆盖被忽略、平台默认扩展或缓存复用越权。私聊使用 Hermes 平台工具配置。
 
 ## 可选群聊上下文与参与
 
@@ -29,6 +29,10 @@ OneBot reader 先区分事件和 API 响应。连接后调用 `get_login_info` �
 Hermes 的 `handle_message()` 只完成入队。适配器通过 `on_processing_start()` 关联实际后台任务，在任务结束后释放群队列和跨群处理名额；同群主动与直接请求共用执行锁。每个后台任务按消息重新绑定主动回复标记，防止 Hermes 排队任务继承上一轮的标记。管理员控制命令及待处理澄清问题的回答绕过等待队列。历史查询的清理由查询任务完成回调负责，取消等待者不会阻止后续重连回填。
 
 `proactive_assist` 默认关闭，启用后默认 dry-run。控制器合并同一发言人的连续短句，等待静默窗口，以规则或独立无工具分类器决定是否参与，并限制冷却、模型判断次数和发言次数。实际主动回复要求 `group_toolsets: []`，继续使用获准发言人的真实身份且关闭网关控制权限。第一段发送前再次核对群状态与过期时间，发送开始后保留原有部分成功和不确定投递语义。
+
+`continuation.py` 与普通主动参与分离：原请求单独保留，相关成员补充按到达顺序进入有界队列；初始任务结束后按不可变快照判断，期间新输入留给下一批。`hermes_runtime.py` 在网关边界解析当前 source/profile 模型做独立无工具判断；只有获准批次进入正常 Agent，会话持久化和工具执行仍由 Hermes 管理。执行身份由所选最新消息决定，原任务和已接纳作者的跨会话权限取交集。原请求、已接纳补充和本批所选输入分别保留，不因尾部闲聊改写任务。
+
+邀请期限控制新输入接纳，已经接纳的输入和长任务结果不依赖普通主动回复有效期。执行前消费批次，失败不重新入队；判断失败保留输入等待新消息。处理任务重新绑定工具策略与协作权限，避免 Hermes 队列继承上一轮身份。撤回不恢复曾被收窄的跨会话权限。
 
 启用后的 `group_recall` 通知会移除缓存并创建有界 tombstone，防止回填恢复已撤回文本。已提交给 Hermes 或模型提供方的内容无法靠缓存撤回收回。配置、数据保留和实际环境验收边界见 [GROUP_CHAT](GROUP_CHAT.md)。
 

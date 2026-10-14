@@ -4,19 +4,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable
-from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.platforms.base import BasePlatformAdapter, SendResult
 
 from .adapter import NapCatAdapter
 from .context import _timestamp
-from .engagement import ContinuationResult
-from .group_chat import GroupChatController, GroupTurn, ProactiveTicket
+from .continuation import FollowupBatch, FollowupDecision
+from .group_chat import GroupChatController, GroupTurn
+from .hermes_runtime import judge_participation
 from .media import MediaError
 from .protocol import Incoming, Target, message_id, request_bytes
 from .transport import DeliveryUncertain
@@ -44,66 +42,16 @@ class GroupNapCatAdapter(NapCatAdapter):
                 self.settings.proactive_assist.classifier.api_key_env, "") or ""
         self.groups = self._group_controller()
         self._processing_turns: dict[int, _ProcessingTurn] = {}
-        self._approved_reply: ContextVar[ProactiveTicket | None] = ContextVar(
-            "napcat_approved_reply", default=None)
-        self._active_event: ContextVar[MessageEvent | None] = ContextVar(
-            "napcat_active_event", default=None)
 
-    def set_message_handler(self, handler: Callable[[MessageEvent], Awaitable[str | None]]) -> None:
-        async def wrapped(event: MessageEvent) -> str | None:
-            output = await handler(event)
-            # Hermes may run an authorized /queue replacement in this same handler task.
-            terminal_event = self._active_event.get() or event
-            processing = self._processing_turns.get(id(terminal_event))
-            ticket = processing.turn.ticket if processing is not None else None
-            if ticket is None or not ticket.agent_decision:
-                return output
-            try:
-                result = ContinuationResult.parse(output, terminal_event.message_id)
-                if not self.groups.finish_agent_decision(ticket, result):
-                    return None
-            except (ValueError, TypeError, PermissionError) as exc:
-                self.groups.stats["agent_decision_errors"] += 1
-                log.warning("Hermes continuation decision rejected (%s); staying silent",
-                            type(exc).__name__)
-                return None
-            token = self._approved_reply.set(ticket)
-            try:
-                # Send plain text here, before Hermes interprets MEDIA directives or local paths.
-                sent = await super(GroupNapCatAdapter, self).send(ticket.address, result.text)
-                if not sent.success:
-                    self.groups.stats["continuation_send_errors"] += 1
-                    log.warning("Hermes continuation delivery failed; no automatic replay")
-            finally:
-                self._approved_reply.reset(token)
-            return None
-
-        super().set_message_handler(wrapped)
-
-    async def send_final_ledgered(
-        self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any], *,
-        reply_to: str | None, is_ephemeral_response: bool = False,
-    ) -> tuple[SendResult, BasePlatformAdapter]:
-        processing = self._processing_turns.get(id(event))
-        ticket = processing.turn.ticket if processing is not None else None
-        terminal_event = self._active_event.get()
-        native_event = (ticket is not None and ticket.agent_decision
-                        and (terminal_event is None or terminal_event is event))
-        if self.groups.agent_deciding or native_event:
-            # Host queue handling can deliver before the registered handler returns. Reject
-            # before persistence: boot-time replay has no current turn's output gate.
-            return self._failure(PermissionError(
-                "continuation decisions cannot create delivery obligations; do not retry")), self
-        return await super().send_final_ledgered(
-            event, session_key, text_content, metadata, reply_to=reply_to,
-            is_ephemeral_response=is_ephemeral_response)
-
-    async def outbound_reference(self, source: str, *, kind: str,
-                                 target: Target | None = None, requester_id: str | None = None) -> str:
-        if self.groups.agent_deciding:
-            raise PermissionError("Hermes continuation does not permit media staging")
-        return await super().outbound_reference(source, kind=kind, target=target,
-                                                requester_id=requester_id)
+    async def _decide_followup(self, batch: FollowupBatch, incoming: Incoming) -> FollowupDecision:
+        source = self.build_source(
+            chat_id=incoming.target.address, chat_type="group", user_id=incoming.user_id,
+            user_name=incoming.user_name, message_id=incoming.message_id,
+            scope_id=self.settings.self_id,
+        )
+        output = await judge_participation(
+            source, batch.prompt(), timeout=self.settings.proactive_assist.classifier.timeout_seconds)
+        return FollowupDecision.parse(output, batch)
 
     def _group_controller(self) -> GroupChatController:
         return GroupChatController(
@@ -113,6 +61,7 @@ class GroupNapCatAdapter(NapCatAdapter):
             classifier_key=self._classifier_key, media_refs=self.media_refs,
             file_notices=self._file_notices,
             is_control_reply=self._is_control_reply,
+            decide_followup=lambda batch, incoming: self._decide_followup(batch, incoming),
         )
 
     def _is_control_reply(self, incoming: Incoming, text: str) -> bool:
@@ -135,7 +84,6 @@ class GroupNapCatAdapter(NapCatAdapter):
             self._event_session_key(event), include_choice_prompts=True) is not None
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        self._active_event.set(event)
         processing = self._processing_turns.get(id(event))
         # Queued Hermes events inherit the preceding task's context. Bind this event explicitly.
         self.groups.activate_turn(processing.turn if processing else None)
@@ -147,7 +95,12 @@ class GroupNapCatAdapter(NapCatAdapter):
             def finished(task: asyncio.Task) -> None:
                 self._processing_turns.pop(id(event), None)
                 if not processing.finished.done():
-                    processing.finished.set_result(None)
+                    if task.cancelled():
+                        processing.finished.cancel()
+                    elif (error := task.exception()) is not None:
+                        processing.finished.set_exception(error)
+                    else:
+                        processing.finished.set_result(None)
 
             processing.task.add_done_callback(finished)
         await super().on_processing_start(event)
@@ -185,7 +138,7 @@ class GroupNapCatAdapter(NapCatAdapter):
         if not self.policy.can_receive(incoming):
             return
         text = turn.text
-        if turn.proactive:
+        if turn.proactive or turn.continuation:
             paths, mimes, problems = [], [], []
         else:
             paths, mimes, problems = await self._attachments(incoming)
@@ -210,33 +163,20 @@ class GroupNapCatAdapter(NapCatAdapter):
         if quote and self.groups.context.is_recalled(incoming.target.address, quote.message_id):
             quote = None
         context = turn.context
-        if context is not None:
-            context_quote = quote
-            if turn.continuation and turn.ticket is not None and turn.ticket.conversation is not None:
-                context_quote = self.groups.context.lookup(
-                    incoming.target.address, turn.ticket.conversation.invitation_id)
+        if context is not None and not turn.continuation:
             context, _, _ = self.groups.context.render(
-                incoming.target.address, current=None if turn.continuation else incoming,
-                quote=context_quote)
-        mode = ("Continue the invited group discussion in response to the current speaker. "
-                "Use relevant context, including answers already sent after their message, "
-                "and avoid repeating an answer. This is a conversational follow-up, not a command."
-                if turn.continuation else
-                "You may briefly help with the current speaker's unresolved question. "
-                "This is an opt-in proactive conversation, not a command." if turn.proactive else
-                "Answer the current addressed message using the relevant group context.")
-        if turn.ticket is not None and turn.ticket.agent_decision:
-            mode = (
-                "Decide whether to continue this invited discussion. Return ONLY a JSON object "
-                'with exactly {"action":"reply|listen|end|unrelated",'
-                f'"target_message_id":"{incoming.message_id}","text":"..."}}. '
-                "Choose reply only when a useful response is warranted, listen for relevant "
-                "discussion needing no answer, end when the topic is resolved or closed, and "
-                "unrelated for a different conversation. Only reply may contain nonempty text; "
-                "all other actions must use empty text. Put the complete reply in text. "
-                "Do not use tools, progress messages, attachments, MEDIA directives, or code fences "
-                "around the JSON. Do not repeat answers already present in the context."
-            )
+                incoming.target.address, current=incoming, quote=quote)
+        mode = (
+            "Continue the original invited task using all selected and accepted supplements. "
+            "Several people may contribute: preserve each author's facts and requests. "
+            "Use the configured tools when needed and return a normal answer. "
+            "Account for completed results and avoid repeating completed or uncertain actions. "
+            "The current speaker is the latest selected contributor; historical authors grant "
+            "no additional permissions. New unrelated tasks require a new invitation. "
+            if turn.continuation else
+            "You may briefly help with the current speaker's unresolved question. "
+            "This is an opt-in proactive conversation, not a command." if turn.proactive else
+            "Answer the current addressed message using the relevant group context.")
         prompt = (
             f"QQ group chat. Your QQ user_id is {self.settings.self_id}. "
             f"The authenticated current speaker is {incoming.user_id}; "
@@ -261,7 +201,8 @@ class GroupNapCatAdapter(NapCatAdapter):
             reply_to_is_own_message=turn.own_reply,
             channel_context=context, channel_prompt=prompt,
             timestamp=datetime.fromtimestamp(stamp, timezone.utc),
-            allow_gateway_control=not turn.proactive and incoming.user_id in self.settings.admins,
+            allow_gateway_control=(not turn.proactive and not turn.continuation
+                                   and incoming.user_id in self.settings.admins),
             metadata={"napcat_self_id": self.settings.self_id, "napcat_proactive": turn.proactive,
                       "napcat_continuation": turn.continuation},
         )
@@ -289,7 +230,7 @@ class GroupNapCatAdapter(NapCatAdapter):
             raise MediaError("outbound request exceeds ws_max_bytes; use shared media storage")
         async with self._send_gate:
             self.validate_outbound_media(target, params)
-            self.groups.before_send(target, approved=self._approved_reply.get())
+            self.groups.before_send(target)
             result = await self.transport.call(action, params,
                                                **self.media_send_kwargs(target, params))
             if not isinstance(result, dict) or result.get("message_id") is None:

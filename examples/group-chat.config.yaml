@@ -9,6 +9,8 @@ gateway:
         # Keep NAPCAT_ALLOW_ALL_USERS=false and NAPCAT_ALLOWED_USERS for private chats/admins.
         allowed_groups: ['987654321']
         group_allowed_chats: ['group:987654321']
+        # Follow-up execution can use explicitly granted tools. Empty means no tools.
+        # For read-only QQ tools use [napcat_qq_read] and qq_tools.read_enabled: true.
         group_toolsets: []
         group_context:
           enabled: true
@@ -41,5 +43,6 @@ gateway:
             max_responses_per_hour: 30
             max_decisions_per_hour: 120
           classifier:
-            # Use the existing Hermes Agent; an independent classifier is optional.
+            # Use the current Hermes profile model for tool-free admission, then run the Agent.
+            # An independent classifier is optional.
             enabled: false

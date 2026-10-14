@@ -97,6 +97,9 @@ def _authorized_target(adapter, session: ToolSession, raw: Any) -> Target:
             raise PermissionError("cross-chat QQ actions are disabled")
         if session.user_id not in adapter.settings.admins:
             raise PermissionError("only a configured QQ administrator may use cross-chat actions")
+        groups = getattr(adapter, "groups", None)
+        if groups is not None and not groups.cross_chat_allowed:
+            raise PermissionError("cross-chat actions require every task contributor to be a configured administrator")
     if not adapter.policy.can_send(target):
         raise PermissionError("target is not allowlisted")
     return target

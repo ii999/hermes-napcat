@@ -11,10 +11,10 @@ from hermes_napcat.media import MediaStore
 from hermes_napcat.policy import Policy
 from hermes_napcat.protocol import Incoming, Target
 from test_adapter import make_adapter
-from test_group_adapter import group_adapter as group_adapter
+from test_group_adapter import background_gateway, group_adapter as group_adapter
 from test_group_context import event
 from test_group_chat import MENTION
-from test_hermes_continuation import decision, wire_handler
+from test_group_continuation import select
 from test_media_pipeline import cached, part
 from test_tools import bind_session
 
@@ -84,10 +84,12 @@ async def test_public_members_share_observation_and_native_continuation(group_ad
     )
     adapter.transport.call = AsyncMock(return_value={"message_id": 900})
     received = []
-    async def decide(message):
-        received.append(message)
-        return decision(message, text="reply to the next speaker")
-    wire_handler(adapter, decide)
+    adapter._decide_followup = AsyncMock(side_effect=lambda batch, incoming: select(batch))
+    async def run(message):
+        if message.metadata['napcat_continuation']:
+            received.append(message)
+            assert (await adapter.send('group:300', 'reply to the next speaker')).success
+    background_gateway(adapter, run)
     try:
         await adapter._receive(event(1, user=997, text="shared background"))
         await adapter._receive(event(2, user=998, text="analyze", parts=[MENTION]))

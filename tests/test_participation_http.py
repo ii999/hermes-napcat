@@ -79,37 +79,34 @@ async def test_classifier_does_not_follow_redirects_or_accept_unbounded_response
             await classifier.close()
 
 
-@pytest.mark.parametrize('respond,status,valid', [
-    (True, 'continue', True), (False, 'continue', True),
-    (False, 'end', True), (False, 'unrelated', True),
-    (True, 'end', False), (True, 'unrelated', False),
-    (False, None, False), (False, 'unknown', False), (False, True, False),
+@pytest.mark.parametrize('action,ids,valid', [
+    ('execute', ['11', '12'], True), ('listen', ['11'], True),
+    ('end', ['12'], True), ('unrelated', [], True),
+    ('execute', [], False), ('unrelated', ['11'], False),
+    ('execute', ['12', '11'], False), ('execute', ['10'], False),
 ])
-async def test_continuation_classifier_status_contract(respond, status, valid):
-    captured = []
+async def test_continuation_classifier_batch_contract(action, ids, valid):
+    from hermes_napcat.context import GroupMessage
+    from hermes_napcat.continuation import FollowupBatch
 
+    captured = []
     async def handler(request):
         captured.append(await request.json())
-        result = {'respond': respond, 'confidence': .95, 'target_message_id': '12'}
-        if status is not None:
-            result['conversation_status'] = status
+        result = {'action': action, 'confidence': .95, 'target_message_id': '12', 'message_ids': ids}
         return web.json_response({'choices': [{'message': {'content': json.dumps(result)}}]})
-
     async with endpoint(handler) as base_url:
         classifier = ParticipationClassifier(ClassifierSettings(
             enabled=True, model='test-model', base_url=base_url))
-        candidate = Candidate('12', '200', '补充一点', False, '10')
+        batch = FollowupBatch(GroupMessage('10', '200', 'A', 1, 'Task'),
+                              (GroupMessage('11', '200', 'A', 2, 'First'),
+                               GroupMessage('12', '201', 'B', 3, 'Second')), (), 'history', 1, 'completed')
         try:
             if valid:
-                decision = await classifier.decide(candidate, 'untrusted group history')
-                assert decision.respond == respond and decision.conversation_status == status
+                decision = await classifier.decide_followup(batch)
+                assert decision.action == action and decision.message_ids == tuple(ids)
             else:
                 with pytest.raises(ValueError):
-                    await classifier.decide(candidate, 'untrusted group history')
-            body = captured[0]
-            data = json.loads(body['messages'][1]['content'])
-            assert data['conversation_start_id'] == '10'
-            assert data['candidate']['message_id'] == '12'
-            assert 'tools' not in body
+                    await classifier.decide_followup(batch)
+            assert 'tools' not in captured[0]
         finally:
             await classifier.close()
