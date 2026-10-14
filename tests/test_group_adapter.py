@@ -83,7 +83,7 @@ async def test_group_file_notice_is_lazy_and_cannot_anchor_history(group_adapter
 async def test_invited_file_notice_stays_context_only_and_preserves_followup_budget(
     group_adapter, classifier_enabled,
 ):
-    from hermes_napcat.engagement import Decision
+    from test_group_continuation import select
     from test_file_notices import notice
 
     adapter = group_adapter(
@@ -97,8 +97,8 @@ async def test_invited_file_notice_stays_context_only_and_preserves_followup_bud
             "classifier": {"enabled": classifier_enabled, "model": "test-classifier"},
         },
     )
-    adapter.groups.classifier.decide = AsyncMock(
-        return_value=Decision(True, .99, "test", "continue"))
+    adapter.groups.classifier.decide_followup = AsyncMock(side_effect=select)
+    adapter._decide_followup = AsyncMock(side_effect=lambda batch, incoming: select(batch))
     adapter._attachments = AsyncMock(return_value=([], [], []))
     try:
         await adapter._receive(event(1, text="Help me review this report", parts=[MENTION]))
@@ -112,7 +112,7 @@ async def test_invited_file_notice_stays_context_only_and_preserves_followup_bud
         await adapter._receive(upload)
         await adapter.groups.wait_idle()
         adapter.handle_message.assert_not_awaited()
-        adapter.groups.classifier.decide.assert_not_awaited()
+        adapter.groups.classifier.decide_followup.assert_not_awaited()
         adapter._attachments.assert_not_awaited()
         adapter.transport.call.assert_not_awaited()
 
@@ -179,7 +179,9 @@ def test_plugin_registers_group_adapter_and_deferred_recent_tool(hermes_doubles,
     from hermes_napcat.plugin import register
     platform_calls, tool_calls = [], []
     ctx = SimpleNamespace(register_platform=lambda **kw: platform_calls.append(kw),
-                          register_tool=lambda **kw: tool_calls.append(kw))
+                          register_tool=lambda **kw: tool_calls.append(kw),
+                          register_middleware=lambda *args: None,
+                          register_hook=lambda *args: None)
     register(ctx)
     assert any(row['name'] == 'qq_get_recent_messages' for row in tool_calls)
     assert platform_calls[0]['adapter_factory'] is type(group_adapter())
@@ -307,15 +309,14 @@ async def test_disconnect_cancels_background_group_processing(group_adapter):
 
 
 async def test_continuation_gateway_preserves_principal_and_disables_controls_and_media(group_adapter):
-    from hermes_napcat.engagement import Decision
+    from test_group_continuation import select
 
     adapter = group_adapter(proactive_assist={
         'dry_run': False, 'quiet_window_ms': 100,
         'classifier': {'enabled': True, 'model': 'test-classifier'},
         'continuation': {'enabled': True},
     })
-    adapter.groups.classifier.decide = AsyncMock(
-        return_value=Decision(True, .99, 'test', 'continue'))
+    adapter.groups.classifier.decide_followup = AsyncMock(side_effect=select)
     adapter._attachments = AsyncMock(return_value=([], [], []))
     entered, release = asyncio.Event(), asyncio.Event()
     delivered = []
@@ -342,7 +343,7 @@ async def test_continuation_gateway_preserves_principal_and_disables_controls_an
         followup = delivered[-1]
         assert followup.user_id == followup.source.user_id == '200'
         assert followup.source.scope_id == '100' and followup.source.chat_id == 'group:300'
-        assert followup.metadata['napcat_proactive'] and not followup.allow_gateway_control
+        assert not followup.metadata['napcat_proactive'] and not followup.allow_gateway_control
         assert not followup.media_urls and 'initial answer' in followup.channel_context
         adapter._attachments.assert_awaited_once()
     finally:
@@ -351,7 +352,7 @@ async def test_continuation_gateway_preserves_principal_and_disables_controls_an
 
 
 async def test_continuation_keeps_invitation_in_truncated_gateway_context(group_adapter):
-    from hermes_napcat.engagement import Decision
+    from test_group_continuation import select
 
     adapter = group_adapter(
         allowed_users=['200', '201'],
@@ -361,16 +362,15 @@ async def test_continuation_keeps_invitation_in_truncated_gateway_context(group_
             'classifier': {'enabled': True, 'model': 'test-classifier'},
             'continuation': {'enabled': True},
         })
-    adapter.groups.classifier.decide = AsyncMock(
-        return_value=Decision(True, .99, 'test', 'continue'))
+    adapter.groups.classifier.decide_followup = AsyncMock(side_effect=select)
     try:
         await adapter._receive(event(1, text='比较这两个数据库', parts=[MENTION]))
         await adapter.groups.wait_idle()
         await adapter._receive(event(2, user=201, text='哪个更快'))
         await adapter.groups.wait_idle()
         followup = adapter.handle_message.await_args.args[0]
-        rows = [json.loads(line) for line in followup.channel_context.splitlines()][1:]
-        assert [row['message_id'] for row in rows] == ['1']
+        data = json.loads(followup.channel_context)
+        assert data['request']['message_id'] == '1'
         assert followup.user_id == '201' and followup.metadata['napcat_continuation']
         assert followup.reply_to_message_id is None and followup.reply_to_text is None
     finally:

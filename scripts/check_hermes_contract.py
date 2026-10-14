@@ -3,12 +3,83 @@
 from __future__ import annotations
 
 import inspect
+import ast
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+
+def _check_group_policy_contract() -> None:
+    """Use an isolated real manager; no live Agent, tool handler, model, or QQ call."""
+    from agent.auxiliary_client import resolve_provider_client
+    from agent.turn_api_call import perform_api_call
+    from agent.tool_executor import _run_agent_tool_execution_middleware
+    from gateway.run import GatewayRunner
+    from hermes_cli.middleware import VALID_MIDDLEWARE
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from model_tools import get_tool_definitions
+    from toolsets import resolve_toolset, validate_toolset
+    from tools.thread_context import propagate_context_to_thread
+    from tools.tool_search import (
+        assemble_tool_defs, dispatch_tool_describe, dispatch_tool_search,
+    )
+    from hermes_napcat.tool_policy import group_tool_scope, register_group_tool_policy
+
+    assert {"llm_request", "llm_execution", "tool_execution"} <= VALID_MIDDLEWARE
+    assert {"kind", "callback"} <= inspect.signature(PluginContext.register_middleware).parameters.keys()
+    assert {"hook_name", "callback"} <= inspect.signature(PluginContext.register_hook).parameters.keys()
+    assert {"provider", "model", "explicit_base_url", "explicit_api_key", "api_mode", "main_runtime"} <= (
+        inspect.signature(resolve_provider_client).parameters.keys())
+    assert {"source", "user_config"} <= inspect.signature(
+        GatewayRunner._resolve_session_agent_runtime).parameters.keys()
+    assert "source" in inspect.signature(GatewayRunner._profile_scope_for_source).parameters
+    assert "func" in inspect.signature(GatewayRunner._run_in_executor_with_context).parameters
+    assert {"enabled_toolsets", "disabled_toolsets", "skip_tool_search_assembly"} <= (
+        inspect.signature(get_tool_definitions).parameters.keys())
+    assert callable(resolve_toolset) and callable(validate_toolset)
+    assert callable(assemble_tool_defs) and callable(propagate_context_to_thread)
+    for dispatch in (dispatch_tool_search, dispatch_tool_describe):
+        assert "current_tool_defs" in inspect.signature(dispatch).parameters
+
+    # Confirm that the installed source actually calls the policy entry points,
+    # beyond merely exporting callable registration methods. No core patching.
+    for function, expected in (
+        (perform_api_call, {"run_llm_execution_middleware"}),
+        (_run_agent_tool_execution_middleware,
+         {"apply_tool_request_middleware", "run_tool_execution_middleware"}),
+    ):
+        tree = ast.parse(inspect.getsource(function))
+        calls = {node.func.id for node in ast.walk(tree)
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+        assert expected <= calls, f"Installed Hermes no longer calls {sorted(expected)}"
+
+    manager = PluginManager(scope_key=str(ROOT))
+    ctx = PluginContext(PluginManifest(name="napcat-contract-probe"), manager)
+    register_group_tool_policy(ctx)
+    source = SimpleNamespace(platform="napcat", chat_id="group:300", user_id="200", profile="")
+    adapter = SimpleNamespace(settings=SimpleNamespace(group_toolsets=()))
+    request = {"model": "probe", "tools": [{"type": "function", "function": {
+        "name": "terminal", "parameters": {"type": "object"}}}], "tool_choice": "auto"}
+    dispatched = []
+    with group_tool_scope(adapter, source):
+        results = manager.invoke_middleware("llm_request", request=request, platform="napcat")
+        assert len(results) == 1 and "tools" not in results[0]["request"]
+        results = manager.invoke_middleware(
+            "llm_execution", request=request, platform="napcat", next_call=lambda payload: payload)
+        assert len(results) == 1 and "tools" not in results[0]
+        results = manager.invoke_middleware(
+            "tool_execution", tool_name="terminal", args={},
+            next_call=lambda args: dispatched.append(args))
+        assert len(results) == 1 and "error" in json.loads(results[0])
+        vetoes = manager.invoke_hook("pre_tool_call", tool_name="terminal", args={})
+        assert vetoes and vetoes[0]["action"] == "block"
+    assert not dispatched
+    print("PASS: real Hermes policy registration, source call sites and empty-cap callbacks")
+    print("PASS: selected-runtime admission and scoped deferred-catalog API signatures")
 
 
 def main() -> None:
@@ -54,9 +125,13 @@ def main() -> None:
     assert {"toolset", "schema", "handler", "is_async"}.issubset(tool_parameters)
     entries = []
     tools = []
+    middleware = []
+    hooks = []
     register(SimpleNamespace(
         register_platform=lambda **kw: entries.append(PlatformEntry(**kw)),
         register_tool=lambda **kw: tools.append(kw),
+        register_middleware=lambda kind, callback: middleware.append((kind, callback)),
+        register_hook=lambda name, callback: hooks.append((name, callback)),
     ))
     assert len(entries) == 1 and entries[0].name == "napcat"
     assert entries[0].parse_target_ref_fn("group:12345") == ("group:12345", None)
@@ -67,6 +142,8 @@ def main() -> None:
     assert by_name["qq_get_forward"]["toolset"] == "napcat_qq_read"
     assert by_name["qq_send_message"]["toolset"] == "napcat_qq"
     assert all(item["is_async"] for item in tools)
+    assert {kind for kind, _ in middleware} == {"llm_request", "llm_execution", "tool_execution"}
+    assert {name for name, _ in hooks} == {"pre_tool_call"}
     # Exercise the host's native chat grant with test-owned IDs, without a gateway or secrets.
     probe = SimpleNamespace(_adapter_extra_for_source=lambda source: {
         "group_allowed_chats": ["group:300"]})
@@ -79,6 +156,7 @@ def main() -> None:
             probe, source, None, chat_type == "group", False) is expected
     print("PASS: real Hermes imports, adapter contract, platform and QQ tool registration")
     print("PASS: Hermes native group grant helper isolates group IDs from private chats")
+    _check_group_policy_contract()
     print("This check does not exercise the full gateway/session runner or a real QQ account.")
 
 

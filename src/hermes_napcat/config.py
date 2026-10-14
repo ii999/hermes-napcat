@@ -372,11 +372,9 @@ class Settings(StrictModel):
         if self.proactive_assist.enabled or self.proactive_assist.continuation.enabled:
             if not self.group_context.enabled or not self.group_context.observe_untriggered:
                 raise ValueError("proactive assist requires enabled live group context")
-            if not self.proactive_assist.dry_run and self.group_toolsets:
+            if (self.proactive_assist.enabled and not self.proactive_assist.dry_run
+                    and self.group_toolsets):
                 raise ValueError("live proactive assist requires group_toolsets=[]")
-        if (self.proactive_assist.continuation.enabled
-                and not self.proactive_assist.classifier.enabled and self.group_toolsets):
-            raise ValueError("Hermes group continuation requires group_toolsets=[], including dry-run")
         parsed = urlsplit(self.ws_url)
         if (parsed.scheme not in ("ws", "wss") or not parsed.hostname or parsed.username or
                 parsed.password or parsed.query or parsed.fragment):

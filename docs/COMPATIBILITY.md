@@ -23,15 +23,19 @@
 
 目录插件暴露 `__init__.py:register(ctx)`。`register_platform` 使用 PlatformEntry 字段，包含目标解析、独立 sender、授权环境变量和默认投递目标。standalone sender 支持 `media_files` 的 `(local_path, is_voice)` 列表和 `force_document`；预检整个组合后投递。仍拒绝 native thread，反向独立 sender 需改用实时 Gateway。
 
-配置读取使用 `get_scoped_secret`，不在插件里写进程全局环境。私聊及未开放群的成员允许名单须同时让 Hermes 的 gateway 鉴权可见。全员授权群通过 `extra.group_allowed_chats` 传递给 Hermes 原生群授权分支：适配器发布规范化的 `group:<id>` 字符串列表，所有项必须也在插件的 `allowed_groups` 中，拒绝通配符和私聊目标。该原生分支只对群类会话生效，优先于普通用户白名单；配置属于实际接收消息的适配器/profile，不修改全局环境。群会话工具限制采用 toolsets_for_source()。`scripts/check_hermes_contract.py` 增加原生群授权 helper 的群/私聊隔离检查；本次仅完成源码核验及模拟插件测试，未在真实安装中执行该脚本。源码检查不能证明外部 profile 路由、memory 或其他 Hermes 插件不会改变行为，部署验收需要覆盖这些组合。
+配置读取使用 `get_scoped_secret`，不在插件里写进程全局环境。私聊及未开放群的成员允许名单须同时让 Hermes 的 gateway 鉴权可见。全员授权群通过 `extra.group_allowed_chats` 传递给 Hermes 原生群授权分支：适配器发布规范化的 `group:<id>` 字符串列表，所有项必须也在插件的 `allowed_groups` 中，拒绝通配符和私聊目标。该原生分支只对群类会话生效，优先于普通用户白名单；配置属于实际接收消息的适配器/profile，不修改全局环境。群工具的实际约束见下文。`scripts/check_hermes_contract.py` 包含原生群授权 helper 的群/私聊隔离检查；本次仅完成源码核验及模拟插件测试，当前项目环境缺少 Hermes `gateway` 模块，无法执行真实安装检查。部署验收需要覆盖实际 profile 路由、memory 和其他 Hermes 插件组合。
 
 QQ 工具通过公开 `ctx.register_tool()` 注册，在目录插件 manifest 声明发现信息，适配 deferred platform loading。handler 使用 `gateway.session_context.get_session_env()` 取得 task-local 来源；action 调度读取 `gateway.run._gateway_runner_ref` 和 runner `_authorization_adapter()`，后两者是 Hermes 内部接口。升级后必须重新执行接口检查及真实工具调用。读工具现在属于 `napcat_qq_read`，发送属于 `napcat_qq`；旧配置要显式增加读工具集。
 
 群调度使用 `on_processing_start()` 跟踪后台任务、内部 `_gateway_accepted` 标记、`should_bypass_active_session()` 以及 `_event_session_key()`/`get_pending_for_session()` 澄清匹配。升级时需复核。后台排队、上下文切换和关闭取消有模拟覆盖，尚未完成真实 Gateway 联调。
 
-原生受邀续聊复用 `BasePlatformAdapter.set_message_handler(handler)` 注册的处理器；`on_processing_start()` 将真实后台处理任务绑定到当前候选。处理器返回结构化决定，插件校验后直接发送纯文本，并返回 `None` 抑制宿主的最终附件解析与发送。已源码核验 [run_turn.py](https://github.com/NousResearch/hermes-agent/blob/v2026.9.14/gateway/run_turn.py) 中的进度、流式、语音投递可能发生在处理器返回前，因此发送门禁覆盖这些路径，且媒体预处理入口另行拒绝。QQ 适配器声明不支持编辑和原生流式；不能只依赖该声明阻止中间输出。Hermes 可能在插件校验前持久化结构化结果。该路径有模拟生命周期测试，尚未通过真实 Gateway/模型/QQ 验收。
+原生受邀续聊先进行独立无工具判断，再调用正常 Gateway 处理器执行获准任务。判断阶段进入实际来源的 `_profile_scope_for_source()`，通过 `_resolve_session_agent_runtime(source=..., user_config=...)` 取得 session `/model`、channel override 或 profile 默认选择，再用公开 `agent.auxiliary_client.resolve_provider_client()` 创建专用客户端。只发送有界判断提示，不创建 `AIAgent`，不读取或写入主会话历史，不进行媒体理解或工具调度，也不进入辅助调用的重试／fallback 路径。客户端模型、显式 endpoint 和 API 格式必须保留当前选择；不满足时明确失败并旁听。`auto`、MoA、ACP 等无法证明该独立判断契约的虚拟／命令 provider 当前不支持。截止时间包含排队和 provider 调用；完成、异常和取消都释放专用客户端。原生执行保留正常工具、媒体和最终投递生命周期，结构化判断不会进入会话记录或投递账本。上述 runner 方法是内部接口，升级时必须重新核验。
 
-Hermes 的 `/queue` 路径可能在处理器返回前投递首个结果。插件覆盖公开 `send_final_ledgered()`，在创建可恢复投递记录之前拒绝原生续聊的内部结果，防止重启补投递泄漏决策 JSON。宿主通过 `on_processing_start()` 切换到已授权的排队请求后，插件按实际终结消息处理普通回复。此处依赖宿主生命周期回调，升级时须复核；模拟测试覆盖投递记录拦截、无回合上下文的恢复及排队回复保留。插件直接发送的续聊正文不进入 Hermes 最终回复投递账本；失败由插件日志和计数器记录，宿主回合完成不代表 QQ 已投递成功，也不会据此重发续聊正文。
+群工具约束独立于 `toolsets_for_source()`。本次核验的 tag `v2026.9.14` 解析到 commit `345cd2b057a452236de401d3534b8502a7465e8d`：[run_turn.py](https://github.com/NousResearch/hermes-agent/blob/345cd2b057a452236de401d3534b8502a7465e8d/gateway/run_turn.py) 忽略空列表 override，[tools_config.py](https://github.com/NousResearch/hermes-agent/blob/345cd2b057a452236de401d3534b8502a7465e8d/hermes_cli/tools_config.py) 还会补入原生、未确认的插件和 MCP 默认工具。因此插件使用公开 `register_middleware()` 的 `llm_request`、`llm_execution`、`tool_execution` 及 `pre_tool_call` hook，同时限制发往模型的定义和实际调度。`group_toolsets: []` 直接成为空授权；非空授权通过显式 `resolve_toolset()` 和 `get_tool_definitions()` 解析，再减去 profile 的 `agent.disabled_toolsets`，不经过平台默认扩展。即使模型自行输出未展示的工具调用、Agent 缓存仍有较宽定义、MCP 刷新或注册表新增工具，都必须重新通过当前群上限。无法解析授权时删除工具定义并明确拒绝执行；不能依赖抛异常实现拒绝，因为宿主 middleware 异常可能继续执行。
+
+适配器在注册处理器外层绑定工具 scope，并在 `on_processing_start()` 用实际排队事件重新绑定。Hermes 主 executor 以及顺序／并行工具 worker 的 ContextVars 传播已源码核验；私聊和其他平台保持原有工具选择。Tool Search 的内嵌目录、搜索和描述使用群授权目录，普通 deferred `tool_call` 解包后按实际工具名核验。仍保持批量包装的 connector `tool_call` 和 `delegate_task` 暂不支持，调用会返回明确的策略错误，不能默默扩展权限。普通获准 web、QQ、文件工具仍可执行。共享续聊不具备跨会话授权时，宿主 `send_message` 和 `cronjob_manage` 也被禁用，QQ 工具继续执行当前成员和目标 ACL 检查。
+
+显式配置的 `terminal`／`execute_code` 是操作者授予群成员的任意命令／代码能力，不构成限制网络目的地的 sandbox。`execute_code` 的具名工具 RPC 在已核验源码中经带 ContextVars 的线程返回 `model_tools.handle_function_call()`，仍受群工具和 QQ 目标检查；直接由命令或代码发出的网络请求无法由具名工具策略约束。需要限制任意代码网络访问的部署不能授予这些工具。没有公开注册表工具集的运行时能力（例如部分 context engine 工具）不能通过该群上限授予；无法解析配置时整体拒绝群工具授权，需检查宿主注册和配置。判断、工具上限、缓存、线程、排队和失败处理已有模拟测试；未进行真实模型／Gateway／QQ 联调。兼容脚本新增实际 middleware 注册、空授权回调、源代码调用入口和判断／deferred 目录签名检查，仍不能代替完整真实环境验收。
 
 ## 媒体理解与缓存接口（2026-10-08，源码核验）
 

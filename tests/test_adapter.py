@@ -141,6 +141,8 @@ def test_plugin_registration_exposes_gateway_hooks_and_qq_tools(hermes_doubles):
     register(SimpleNamespace(
         register_platform=lambda **kwargs: captured.update(kwargs),
         register_tool=lambda **kwargs: registered_tools.append(kwargs),
+        register_middleware=lambda *args: None,
+        register_hook=lambda *args: None,
     ))
     assert captured["name"] == "napcat"
     assert captured["allowed_users_env"] == "NAPCAT_ALLOWED_USERS"

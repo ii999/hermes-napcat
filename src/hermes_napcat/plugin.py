@@ -90,7 +90,9 @@ async def standalone_send(pconfig, chat_id, message, *, thread_id=None,
 def register(ctx):
     from .group_adapter import GroupNapCatAdapter
     from .group_tools import register_tools
+    from .tool_policy import register_group_tool_policy
 
+    register_group_tool_policy(ctx)
     register_tools(ctx)
     ctx.register_platform(
         name="napcat", label="NapCat / QQ", adapter_factory=GroupNapCatAdapter,
