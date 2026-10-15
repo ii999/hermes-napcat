@@ -38,9 +38,17 @@ def runtime(monkeypatch):
         def close(self):
             self.closed += 1
 
+    class CodexClient(Client):
+        pass
+
+    class AnthropicClient(Client):
+        pass
+
     def resolve(provider, **kwargs):
         routed.append((profile.get(), provider, kwargs))
-        client = Client()
+        client_type = {"codex_responses": CodexClient,
+                       "anthropic_messages": AnthropicClient}.get(kwargs["api_mode"], Client)
+        client = client_type()
         if setup.prepare:
             setup.prepare(client)
         clients.append(client)
@@ -74,7 +82,7 @@ def runtime(monkeypatch):
             "_gateway_runner_ref": lambda: setup.runner, "_load_gateway_config": load},
         "agent": {}, "agent.auxiliary_client": {
             "resolve_provider_client": resolve,
-            "AnthropicAuxiliaryClient": Client, "CodexAuxiliaryClient": Client},
+            "AnthropicAuxiliaryClient": AnthropicClient, "CodexAuxiliaryClient": CodexClient},
     }.items():
         module = types.ModuleType(name)
         module.__dict__.update(attrs)
@@ -87,21 +95,33 @@ def source(profile="secondary", model="selected-session-model", api_mode="codex_
     return SimpleNamespace(profile=profile, model=model, provider="custom", api_mode=api_mode)
 
 
-async def test_current_profile_session_model_and_api_mode_without_tools(runtime):
-    text = await judge_participation(source(), "strict decision prompt", timeout=1, max_tokens=123)
+@pytest.mark.parametrize("api_mode", ["codex_responses", "anthropic_messages", "chat_completions", None])
+async def test_current_profile_session_model_and_api_mode_without_tools(runtime, api_mode):
+    text = await judge_participation(source(api_mode=api_mode), "strict decision prompt",
+                                     timeout=1, max_tokens=123)
     assert text == '{"action":"observe"}'
     assert runtime.configs == ["secondary"]
     profile, provider, route = runtime.routed[0]
     assert (profile, provider, route["model"], route["api_mode"]) == (
-        "secondary", "custom", "selected-session-model", "codex_responses")
+        "secondary", "custom", "selected-session-model", api_mode)
     request_profile, request = runtime.clients[0].calls[0]
     assert request_profile == "secondary"
     assert request["model"] == "selected-session-model"
     assert request["messages"] == [{"role": "user", "content": "strict decision prompt"}]
     assert request["max_tokens"] == 123 and request["timeout"] == 1
-    assert "tools" not in request and "extra_body" not in request
+    assert "tools" not in request
+    if api_mode == "codex_responses":
+        assert request["extra_body"] == {"reasoning": {"effort": "low", "enabled": True}}
+    else:
+        assert not {"extra_body", "reasoning", "reasoning_effort", "thinking"}.intersection(request)
     assert runtime.clients[0].closed == 1
     assert runtime.profile.get() == "outside"
+
+
+async def test_plain_transport_without_codex_adapter_keeps_request_defaults(runtime, monkeypatch):
+    monkeypatch.delattr(sys.modules["agent.auxiliary_client"], "CodexAuxiliaryClient")
+    await judge_participation(source(api_mode="chat_completions"), "decision", timeout=1)
+    assert "extra_body" not in runtime.clients[0].calls[0][1]
 
 
 async def test_concurrent_profiles_keep_selected_runtimes_independent(runtime):

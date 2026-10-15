@@ -196,7 +196,18 @@ class GroupContinuation:
     def initial_finished(self, state: Invitation, *, failed: bool = False) -> None:
         state.completed_turns += 1
         state.last_outcome = "failed; do not replay completed or uncertain effects" if failed else "completed"
+        # Idle starts when the reply finishes. A turn longer than idle_seconds
+        # otherwise closes the window before anyone can supplement.
+        self._refresh_idle(state)
         state.ready.set()
+
+    def _refresh_idle(self, state: Invitation, *, activity_at: float | None = None) -> None:
+        if state.closed:
+            return
+        activity_at = time.monotonic() if activity_at is None else activity_at
+        # A queued message can predate the reply that most recently renewed the window.
+        state.expires = min(state.deadline,
+                            max(state.expires, activity_at + self.config.idle_seconds))
 
     def discard(self, address: str, state: Invitation) -> None:
         if self._states.get(address) is state:
@@ -338,7 +349,7 @@ class GroupContinuation:
                 self.end(address)
             return True
         if selected:
-            state.expires = min(state.deadline, received_at + self.config.idle_seconds)
+            self._refresh_idle(state, activity_at=received_at)
         if decision.action != "execute" or principal is None or not self._responses.take(address):
             return True
         if self.settings.proactive_assist.dry_run:
@@ -360,6 +371,7 @@ class GroupContinuation:
             log.warning("Continuation execution failed (%s); no automatic replay", type(exc).__name__)
         finally:
             state.completed_turns += 1
+            self._refresh_idle(state)
         return True
 
     async def wait_idle(self) -> None:

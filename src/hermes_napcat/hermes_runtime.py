@@ -141,11 +141,18 @@ async def judge_participation(
                         raise HermesDecisionError("Hermes admission could not retain the selected API format")
                 if cancelled.is_set():
                     raise HermesDecisionError("Hermes admission was cancelled")
-                # No auxiliary task routing, fallback ladder, request overrides, or tools.
+                # Only the verified Codex/Responses adapter translates this reasoning shape
+                # and clamps effort for its model. Other transports retain their defaults.
+                codex_transport = getattr(auxiliary_client, "CodexAuxiliaryClient", None)
+                request_options = {}
+                if isinstance(codex_transport, type) and isinstance(client, codex_transport):
+                    request_options["extra_body"] = {"reasoning": {"effort": "low", "enabled": True}}
+                # No auxiliary task routing, fallback ladder, or tools.
                 response = client.chat.completions.create(
                     model=wire_model,
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=max_tokens, timeout=timeout,
+                    **request_options,
                 )
                 return _decision_text(response)
         except HermesDecisionError:
