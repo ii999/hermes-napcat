@@ -162,6 +162,52 @@ async def test_preexpiry_input_and_admitted_results_survive_long_execution(clock
         await ctl.close()
 
 
+@pytest.mark.parametrize("during_followup", [False, True])
+@pytest.mark.parametrize("failed", [False, True])
+async def test_reply_renews_idle_and_queued_listen_cannot_shorten_it(clock, during_followup, failed):
+    entered, release = asyncio.Event(), asyncio.Event()
+    turns = []
+
+    async def dispatch(turn):
+        turns.append(turn)
+        if turn.continuation == during_followup and not entered.is_set():
+            entered.set()
+            await release.wait()
+            if failed:
+                raise RuntimeError("uncertain effect")
+
+    ctl = continuing_controller(dispatch=dispatch)
+    ctl.classifier.decide_followup.side_effect = lambda batch: select(
+        batch, "listen" if batch.target_message_id == "3" else "execute")
+    try:
+        await ctl.receive(event(1, parts=[MENTION]))
+        if during_followup:
+            await ctl.wait_idle()
+            clock[0] = 110
+            await ctl.receive(event(2, text="Start followup work"))
+        await asyncio.wait_for(entered.wait(), 1)
+        clock[0] = 120
+        await ctl.receive(event(3, text="A fact to keep for later"))
+        clock[0] = 300
+        release.set()
+        await asyncio.wait_for(ctl.wait_idle(), 2)
+        clock[0] = 419
+        await ctl.receive(event(4, text="A correction after the reply"))
+        await ctl.wait_idle()
+        assert turns[-1].incoming.message_id == "4"
+        batch = turns[-1].followup.batch
+        assert any(row.message_id == "3" for row in batch.accepted)
+        assert ("uncertain" in batch.last_outcome) == failed
+        completed = len(turns)
+        clock[0] = 540
+        await ctl.receive(event(5, text="After the renewed idle window"))
+        await ctl.wait_idle()
+        assert len(turns) == completed
+    finally:
+        release.set()
+        await ctl.close()
+
+
 async def test_listen_retains_contributions_and_unrelated_does_not_renew(clock):
     ctl = continuing_controller()
     try:

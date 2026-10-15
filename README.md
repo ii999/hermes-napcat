@@ -20,7 +20,7 @@ QQ ↔ NapCat ↔ OneBot v11 WebSocket ↔ Hermes NapCat Plugin ↔ Hermes Gatew
 | 群聊背景 | 可选实时观察、有界回填，保留发言人、时间、@和引用 | 模拟接口；实机待验收 |
 | 主动参与 | 默认关闭，启用后默认 dry-run；规则/无工具分类器、冷却和预算 | 模拟接口与本地分类器协议；实机待验收 |
 | 群成员授权 | 指定群全员可对话并共享背景，私聊保持用户白名单；管理员权限独立 | 模拟接口；Hermes 群授权源码核验，真实联调待验收 |
-| 群聊续聊 | 推荐开启；多人按顺序补充同一任务，先无工具判断，再正常使用配置的工具执行 | Hermes 源码核验、模拟接口与可选分类器协议；真实模型和 QQ/Hermes 联调待验收 |
+| 群聊续聊 | 推荐开启；多人按顺序补充同一任务，先无工具判断，再正常使用配置的工具执行；执行结束刷新空闲窗口，仍受最长时限约束 | Hermes 源码核验、模拟接口与可选分类器协议；真实模型和 QQ/Hermes 联调待验收 |
 | Agent QQ 工具 | `napcat_qq_read` 只读与 `napcat_qq` 发送分别授权 | 接口替身；真实工具发现待验收 |
 | 连接与可靠性 | 正向/反向 WS、token/账号核验、重连、echo、队列、限流和内存去重 | 真实 loopback 网络；QQ 断线待验收 |
 | 定时投递 | Hermes 目标解析；独立正向 sender 支持组合文本/本地媒体和 `force_document` | 源码与接口替身；真实 cron 待验收 |
@@ -157,7 +157,7 @@ uv run hermes-napcat --config examples/napcat.yaml send \
 
 推荐使用 [群聊配置示例](examples/group-chat.config.yaml)：替换示例群号并合并到现有配置，沿用 Hermes 当前模型，无需另配分类器。示例通过 `group_allowed_chats: ["group:987654321"]` 允许该群全员对话，通过 `group_sessions_per_user: false` 共享群会话，并开启全员背景观察、历史回填和实际续聊。每个开放群也必须在 `allowed_groups` 中；保持 `NAPCAT_ALLOW_ALL_USERS=false`，私聊和管理员继续使用 `NAPCAT_ALLOWED_USERS`。共享会话设置是 Hermes 全局选项，也会影响其他平台的群；应让成员知晓共享范围和数据用途。
 
-推荐保持 `proactive_assist.enabled: false`，设置 `proactive_assist.continuation.enabled: true`，让机器人被叫到后连续对话。续聊默认空闲 120 秒、最长 600 秒；先用当前 profile 模型做无工具准入判断，再由普通 Hermes Agent 使用配置的工具执行，独立分类器可选。多人补充会保留作者和顺序，已接纳长任务不因窗口到期丢失结果；dry-run 只判断、不执行。插件在模型请求和实际调用处约束群工具集，空列表不会继承平台工具。完整配置见 [被叫到后的连续对话](docs/GROUP_CHAT.md#被叫到后的连续对话)。
+推荐保持 `proactive_assist.enabled: false`，设置 `proactive_assist.continuation.enabled: true`，让机器人被叫到后连续对话。续聊默认空闲 120 秒，执行结束后刷新空闲计时，同一次邀请最长 600 秒；先用当前 profile 模型做无工具准入判断，再由普通 Hermes Agent 使用配置的工具执行，独立分类器可选。多人补充会保留作者和顺序，已接纳长任务不因窗口到期丢失结果；dry-run 只判断、不执行。插件在模型请求和实际调用处约束群工具集，空列表不会继承平台工具。完整配置见 [被叫到后的连续对话](docs/GROUP_CHAT.md#被叫到后的连续对话)。
 
 未被叫到时的主动插话是独立选项。需要时再开启 `proactive_assist.enabled`，先用 `dry_run: true` 观察决策；这也会暂停实际续聊。历史回填有数量和时间边界，不保证补齐断线期间全部消息。配置、分类器和验收步骤见 [群聊指南](docs/GROUP_CHAT.md)。
 
