@@ -155,6 +155,19 @@ async def test_forward_handles_embedded_nodes_and_stops_at_depth_limit():
     assert expanded.nodes[1].message["message"][0]["data"]["text"] == "inside"
 
 
+async def test_forward_card_descriptions_share_the_text_byte_budget():
+    instance = adapter(qq_tools={"max_forward_chars": 100})
+    instance.verified_message.return_value = forward_parent()
+    instance.transport.call.return_value = {"messages": [node(message=[
+        {"type": "share", "data": {"title": "界" * 200, "url": "https://example.com"}},
+        {"type": "text", "data": {"text": "tail"}},
+    ])]}
+    expanded = await expand_forward(instance, Target.parse("private:200"), "1")
+    text = "".join(part["data"]["text"] for n in expanded.nodes for part in n.message["message"])
+    assert len(text.encode()) <= 100 and expanded.truncated
+    assert "分享卡片" in text and "tail" not in text
+
+
 async def test_forward_reports_partial_unavailable_and_rechecks_recall_after_await():
     instance = adapter()
     target = Target.parse("private:200")
@@ -193,8 +206,12 @@ async def test_forward_tool_bounds_total_refs_and_binds_claimed_authors_to_paren
         hermes_doubles.PlatformConfig(extra=config.model_dump()))
     images = [{"type": "image", "data": {"file": f"image-{index}",
                "url": "https://secret-locator.example/image"}} for index in range(3)]
+    card = {"type": "json", "data": {"data": json.dumps({"meta": {"news": {
+        "title": "Forwarded article", "desc": "Article summary",
+        "jumpUrl": "https://example.com/article", "preview": "https://secret-locator.example/card",
+    }}})}}
     instance.transport.call = AsyncMock(side_effect=[
-        forward_parent(), {"messages": [node(message=images), node(message=images)]},
+        forward_parent(), {"messages": [node(message=[*images, card]), node(message=images)]},
     ])
     session = SimpleNamespace(current_message_id="1", target=target, user_id="200")
     async def operation_boundary(_name, _args, operation, **_kwargs):
@@ -206,6 +223,8 @@ async def test_forward_tool_bounds_total_refs_and_binds_claimed_authors_to_paren
     assert len(refs) == 2
     assert "secret-locator.example" not in json.dumps(result)
     assert result["nodes"][0]["sender"]["user_id"] == "999"
+    assert all(value in result["nodes"][0]["text"] for value in (
+        "Forwarded article", "Article summary", "https://example.com/article"))
     for ref in refs:
         item = instance.media_refs.get(ref["media_id"], target)
         assert item.user_id == "200" and item.message_id == "1"

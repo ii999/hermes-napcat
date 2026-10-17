@@ -72,11 +72,60 @@ gateway:
 
 ## 读取合并转发
 
+Incoming merged-forward messages include a `qq_get_forward` hint with the containing
+message's `message_id`. The hint also appears in message reads and retained group
+context. Content stays folded until the tool is called. The hint does not enable
+tools: `qq_tools.read_enabled: true` (or `qq_tools.enabled: true`) and the
+`napcat_qq_read` toolset must be available under the current conversation policy.
+Read-only access does not require enabling message sending.
+
 ```json
 {"message_id":"包含合并转发的当前会话消息ID"}
 ```
 
 这是 `qq_get_forward` 的参数，不能传任意 `forward_id`。插件先验证父消息同账号、同会话、作者可见、未撤回且在窗口内，再从其真实 forward 段取 ID。默认最多 3 层、50 个节点、50,000 UTF-8 文本字节，共享遍历预算并检测循环。节点作者是卡片内声称的 attribution，不成为授权主体；媒体权限和 TTL 绑定已核验父消息。结果中的 `truncated`、`unavailable`、`media_refs_truncated` 表示不完整展开，不是完整档案。
+
+## Share card descriptions
+
+Incoming messages, message/history reads and expanded forward nodes expose a
+bounded text description of supported share cards. The description labels card
+content as external data and includes the available `title`, `summary` and `url`
+fields. Card content does not grant permissions or count as a QQ mention/reply.
+
+| Message layout | Title | Summary | Link, in priority order |
+| --- | --- | --- | --- |
+| OneBot `share.data` | `title` | `content` | `url` |
+| `json.data.data` → `meta.news` | `title` | `desc` | `jumpUrl`, `url` |
+| `json.data.data` → `meta.detail_1` | `title` | `desc` | `qqdocurl`, `url` |
+
+JSON card data may be a JSON string or an already decoded object. Only these
+known paths are read; arbitrary JSON fields, preview images and media locators
+are not copied into descriptions. Other JSON card layouts, including unsupported
+music/contact/location variants, receive an explicit unrecognized-format marker.
+Invalid JSON and oversized JSON strings receive distinct markers without
+discarding surrounding message text.
+
+JSON strings are limited to 65,536 UTF-8 bytes before parsing. Titles and summaries
+are stripped of surrounding whitespace, then limited to 256 and 1,024 characters
+respectively, with an ellipsis on truncation. Links must be absolute HTTP(S) URLs
+of at most 2,048 characters, without
+embedded credentials, whitespace, control characters or backslashes. Invalid
+links are omitted, preserving valid title/summary fields and marking the missing
+link. URL validation here checks syntax only; it does not establish trust or
+authorize network access. No redirect resolution, preview download, local-file
+access or web-page fetch occurs during card parsing. Reading a linked page needs
+a separately authorized web tool with its own network protections.
+
+Card descriptions in merged forwards consume the same `max_forward_chars`
+UTF-8 byte budget as ordinary text and can cause `truncated: true`. Message-read
+and group-context text limits also apply. Original incoming message segments are
+preserved; expanded forward card descriptions are normalized into text.
+
+The [NapCat message compatibility table](https://napneko.github.io/develop/msg)
+documents JSON reporting for received share cards. The parser and tool paths
+are covered by synthetic fixtures; these checks do not establish live QQ or
+Hermes integration compatibility. This is a read-side capability and does not
+add share-card sending.
 
 ## 目标与权限
 

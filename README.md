@@ -14,6 +14,7 @@ QQ ↔ NapCat ↔ OneBot v11 WebSocket ↔ Hermes NapCat Plugin ↔ Hermes Gatew
 | --- | --- | --- |
 | 私聊与群聊 | 用户/群白名单，@、回复机器人和 `/ai` 触发 | 模拟接口与 loopback；实机待验收 |
 | 文本收发 | 引用、长文本分段、结构化消息段；CQ 字符串作为普通文本 | 模拟接口；实机待验收 |
+| Forward and share card descriptions | Parent-message hints for `qq_get_forward`; titles, summaries and HTTP(S) links from `share` and supported JSON cards; no automatic web fetch | Synthetic protocol and tool tests; live QQ/Hermes validation pending |
 | 媒体接收 | 图片、语音、视频、文件的认证 WS 分块下载；受控 HTTP 兼容模式和文件通知 | NapCat 源码与 loopback；实机待验收 |
 | 媒体引用与理解 | 同会话当前/引用/近期附件、私聊历史和有界合并转发；Hermes 视觉、转录、视频和文档读取 | Hermes 源码与接口替身；模型/STT/沙箱待验收 |
 | 媒体发送 | 本地文件、受控 URL（含 `*.example.com` 白名单）、base64、共享目录和分块上传；已有消息服务端合并转发 | 源码、模拟接口与 loopback；实机待验收 |

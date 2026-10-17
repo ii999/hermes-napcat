@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import numeric_id
+from .message_content import describe_special_segment
 from .protocol import Target, message_id, segments
 from .transport import OneBotError
 
@@ -257,6 +258,10 @@ async def expand_forward(
                     child = part["data"] if part["type"] == "forward" else {"content": [part]}
                     await walk(child, (*child_path, segment_index), depth + 1)
                     continue
+                if part["type"] in ("share", "json"):
+                    # Card descriptions consume the same text budget as ordinary node text.
+                    part = {"type": "text", "data": {
+                        "text": describe_special_segment(part, identifier)}}
                 if part["type"] == "text":
                     text = part["data"].get("text")
                     if not isinstance(text, str):
