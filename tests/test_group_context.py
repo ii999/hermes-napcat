@@ -119,6 +119,25 @@ def test_recall_tombstone_cannot_be_resurrected_by_backfill():
     assert not rows and "retracted" not in text
 
 
+def test_group_quote_keeps_forward_parent_hint_and_share_metadata():
+    ctx = context()
+    incoming = Incoming.parse(event(-22, text="", parts=[
+        {"type": "forward", "data": {"id": "opaque-forward"}},
+        {"type": "json", "data": {"data": {"meta": {"news": {
+            "title": "Article title", "desc": "Article summary",
+            "jumpUrl": "https://example.com/article", "preview": "https://hidden.example/image",
+        }}}}},
+    ]))
+    assert ctx.put(incoming)
+    quote = ctx.lookup("group:300", "-22")
+    _, rows, _ = ctx.render("group:300", quote=quote)
+    text = rows[0]["text"]
+    assert "qq_get_forward" in text and '"message_id": "-22"' in text
+    assert all(value in text for value in (
+        "Article title", "Article summary", "https://example.com/article"))
+    assert "hidden.example" not in text and "opaque-forward" not in text
+
+
 def test_media_placeholder_has_no_attachment_url_or_bytes():
     ctx = context()
     incoming = Incoming.parse(event(1, parts=[{"type": "image", "data": {

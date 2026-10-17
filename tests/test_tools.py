@@ -220,12 +220,18 @@ async def test_get_message_omits_media_urls(
         "message": [
             {"type": "text", "data": {"text": "see image"}},
             {"type": "image", "data": {"url": "https://secret.example/token", "file": "x"}},
+            {"type": "share", "data": {"title": "Article", "content": "Article summary",
+                                        "url": "https://example.com/article"}},
+            {"type": "forward", "data": {"id": "opaque-forward"}},
         ],
     }
 
     raw = await tools.qq_get_message({"message_id": "12"}, session_id="session-1")
     result = json.loads(raw)
-    assert result["text"] == "see image"
+    assert result["text"].startswith("see image")
+    assert all(value in result["text"] for value in (
+        "Article", "Article summary", "https://example.com/article", "qq_get_forward"))
+    assert '"message_id": "12"' in result["text"] and "opaque-forward" not in raw
     assert result["attachments"] == [{"type": "image"}]
     assert "secret.example" not in raw
 

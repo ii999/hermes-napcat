@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 from .config import numeric_id
 from .media import MediaError, inline_info, is_inline_source
+from .message_content import describe_special_segment
 from .protocol import ProtocolError, Target, message_id, segments
 from .transport import ActionError, DeliveryUncertain, NotConnected, OneBotError
 
@@ -535,6 +536,8 @@ def _message_summary(data: dict[str, Any], target: Target, identifier: str) -> d
                 if isinstance(name, str) and name:
                     item["name"] = name[:200]
                 attachments.append(item)
+            elif (description := describe_special_segment(part, identifier)) is not None:
+                text_values.append(description)
     sender = data.get("sender") if isinstance(data.get("sender"), dict) else {}
     text = "".join(text_values)
     return {

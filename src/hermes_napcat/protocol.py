@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import numeric_id
+from .message_content import describe_special_segment
 
 
 class ProtocolError(ValueError):
@@ -93,6 +94,7 @@ class Incoming:
         except ValueError as exc:
             raise ProtocolError(str(exc)) from exc
         parts = segments(raw.get("message"))
+        identifier = message_id(raw.get("message_id"))
         text: list[str] = []
         mentioned = False
         reply = None
@@ -115,11 +117,13 @@ class Incoming:
                 text.append(f"[QQ表情:{str(data.get('id', ''))[:20]}]")
             elif part["type"] in ("image", "record", "video", "file"):
                 text.append(f"[{part['type']}]")
+            elif (description := describe_special_segment(part, identifier)) is not None:
+                text.append(description)
             else:
                 text.append(f"[不支持的消息类型:{part['type'][:40]}]")
         sender = raw.get("sender") if isinstance(raw.get("sender"), dict) else {}
         name = str(sender.get("card") or sender.get("nickname") or user)[:100]
-        return cls(target, user, self_id, message_id(raw.get("message_id")), name,
+        return cls(target, user, self_id, identifier, name,
                    "".join(text).strip(), parts, mentioned, reply, raw)
 
 
